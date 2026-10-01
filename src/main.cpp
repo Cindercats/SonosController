@@ -35,7 +35,7 @@
 // ---------------------------------------------------------------------------
 
 // Application version. Incremented by 0.01 on each build.
-#define APP_VERSION "0.35"
+#define APP_VERSION "0.37"
 
 // ---------------------------------------------------------------------------
 // WiFi Configuration
@@ -482,25 +482,42 @@ String sanitizeArtist(const String &raw) {
   return raw;
 }
 
-// Resolves a possibly relative artwork URL against the active speaker.
-// Handles absolute http/https URLs, protocol-relative "//host" URLs and
-// bare paths such as "/getaa?id=...".
+// Resolves an artwork URL taken from the GetPositionInfo response.
+//
+// upnp:albumArtURI arrives in two forms:
+//
+//   Relative path  e.g. /getaa?s=1&u=...
+//       Served by the speaker itself, so the speaker's address AND its HTTP
+//       port must be prepended: http://192.168.1.50:1400/getaa?s=1&u=...
+//       Omitting :1400 would request port 80, where the speaker serves
+//       nothing, and the download would fail with a connection error.
+//
+//   Absolute URL   e.g. https://i.scdn.co/image/...
+//       Used as-is. Common with some streaming services and internet radio.
+//
+// Protocol-relative "//host/path" is also accepted.
 String resolveArtworkUrl(const String &raw) {
   String url = raw;
   url.trim();
   if (url.length() == 0) return String();
 
+  // Absolute URL: use it unchanged.
   if (url.startsWith("http://") || url.startsWith("https://")) {
     return url;
   }
 
+  // Protocol-relative: assume http, since the speaker is local.
   if (url.startsWith("//")) {
     return "http:" + url;
   }
 
+  // Relative path: the speaker must be known to build an absolute address.
   if (activeSonosIP[0] == 0) return String();
 
-  String base = "http://" + activeSonosIP.toString();
+  // Port 1400 is the speaker's HTTP port; it serves both the AVTransport SOAP
+  // control endpoint and /getaa.
+  String base = "http://" + activeSonosIP.toString() + ":" +
+                String(SONOS_PORT);
 
   if (url.startsWith("/")) {
     return base + url;
@@ -1378,8 +1395,19 @@ void pollSonos() {
 
   if (artUri != currentArtUri) {
     currentArtUri = artUri;
-    Serial.printf("[Sonos] Artwork URI: %s\n", artUri.c_str());
-    if (artUri.length() > 0 && artUri != cachedArtUrl) {
+
+    if (artUri.length() == 0) {
+      Serial.println("[Sonos] No artwork URI in response for this track.");
+    } else {
+      // Show both forms: what the response contained, and what will actually
+      // be fetched. For a relative path the two differ by scheme, host and
+      // port, which is exactly what needs checking when a download fails.
+      Serial.printf("[Sonos] Artwork as sent: %s\n", artUri.c_str());
+      Serial.printf("[Sonos] Artwork resolved: %s\n",
+                    resolveArtworkUrl(artUri).c_str());
+
+      // downloadArtwork() re-checks against cachedArtUrl using the RESOLVED
+      // url, so no comparison is made here.
       downloadArtwork();
     }
   }
@@ -1510,30 +1538,41 @@ int drawWrappedText(const String &text, int x, int y, int maxWidth,
 
 // Draws the artwork-area placeholder.
 //
-// When the track carries an artwork URL, that URL is shown on screen instead
-// of the generic disc. The URL comes straight out of the GetPositionInfo
-// response, so reading it on the display is the quickest way to confirm that
-// extraction produced a usable address and to see which host/port/path the
-// firmware is being asked to fetch.
+// Shows the RESOLVED artwork URL - the address actually being fetched, not the
+// raw value from the response. The two differ for a relative path, where the
+// response gives "/getaa?s=1&u=..." and the firmware must prepend the
+// speaker's scheme, host and port. Displaying the resolved form is what makes a
+// bad host, port or path visible on the screen.
 void drawArtworkPlaceholder() {
   tft.fillRect(ART_AREA_X, ART_AREA_Y, ART_AREA_W, ART_AREA_H, TFT_BLACK);
 
   if (currentArtUri.length() > 0) {
+    String resolved = resolveArtworkUrl(currentArtUri);
+
     tft.setTextFont(1);
     tft.setTextColor(0xBDF7);
     tft.setTextDatum(TL_DATUM);
 
-    tft.drawString("Artwork URL:", ART_AREA_X + 4, ART_AREA_Y + 4);
+    // Label which form is being shown, and note if resolution failed.
+    tft.drawString(resolved.length() > 0 ? "Fetching (resolved):"
+                                         : "UNRESOLVED - no speaker IP",
+                   ART_AREA_X + 4, ART_AREA_Y + 4);
 
-    int nextY = drawWrappedText(currentArtUri, ART_AREA_X + 4,
-                                ART_AREA_Y + 16, ART_AREA_W - 8, 7, 1);
+    int nextY = drawWrappedText(resolved, ART_AREA_X + 4, ART_AREA_Y + 16,
+                                ART_AREA_W - 8, 5, 1);
 
-    // If the URL did not fit, note that it was truncated.
+    // Always show the raw value too, so both forms can be compared on screen.
     tft.setTextColor(0x6E6E);
-    tft.drawString("(truncated)", ART_AREA_X + 4,
-                   nextY < ART_AREA_Y + ART_AREA_H - 10
+    tft.drawString("from SOAP:", ART_AREA_X + 4,
+                   nextY < ART_AREA_Y + ART_AREA_H - 12
                        ? nextY
-                       : ART_AREA_Y + ART_AREA_H - 10);
+                       : ART_AREA_Y + ART_AREA_H - 12);
+    tft.setTextColor(0x808080);
+    drawWrappedText(currentArtUri, ART_AREA_X + 4,
+                    (nextY < ART_AREA_Y + ART_AREA_H - 12
+                         ? nextY
+                         : ART_AREA_Y + ART_AREA_H - 12) + 10,
+                    ART_AREA_W - 8, 2, 1);
     return;
   }
 
