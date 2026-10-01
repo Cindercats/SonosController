@@ -35,7 +35,7 @@
 // ---------------------------------------------------------------------------
 
 // Application version. Incremented by 0.01 on each build.
-#define APP_VERSION "0.39"
+#define APP_VERSION "0.41"
 
 // ---------------------------------------------------------------------------
 // WiFi Configuration
@@ -1093,13 +1093,20 @@ void sendSonosAction(const char *action, const char *instanceArgs) {
 // Artwork
 // ---------------------------------------------------------------------------
 
+// Artwork diagnostics, surfaced on screen in a large font so the values can
+// be read from a photograph of the display as well as from the serial log.
+int    artLastStatus  = 0;      // HTTP status, 0 = not attempted
+String artLastRoute;            // "DIRECT", "PROXY" or "UNRESOLVED"
+String artLastHost;             // host the request went to
+String artLastNote;             // short reason text
+
 // Downloads the current track artwork into LittleFS.
 //
 // Source URL: the <upnp:albumArtURI> value read from <CurrentTrackMetaData>,
-// typically http://<speaker-ip>:1400/getaa?u=<url-encoded upstream URI>.
-// It may be relative (resolved against the speaker), http, or https, and
-// commonly answers with a redirect to a CDN, so up to HTTP_MAX_REDIRECTS
-// hops are followed manually.
+// typically /getaa?s=1&u=<url-encoded upstream URI> or an absolute https URL.
+// resolveArtworkUrl() may route it directly to the upstream host or through
+// the speaker on port 1400. Redirects are followed manually, up to
+// HTTP_MAX_REDIRECTS hops.
 //
 // Verbose logging is emitted throughout to assist debugging.
 void downloadArtwork() {
@@ -1107,6 +1114,9 @@ void downloadArtwork() {
 
   String url = resolveArtworkUrl(currentArtUri);
   if (url.length() == 0) {
+    artLastStatus = 0;
+    artLastRoute  = "UNRESOLVED";
+    artLastNote   = "no speaker IP";
     Serial.println("[Art] Could not resolve artwork URL.");
     return;
   }
@@ -1116,8 +1126,28 @@ void downloadArtwork() {
     return;
   }
 
+  // Record the route and host for the on-screen panel.
+  artLastRoute = (url.startsWith("http://" + activeSonosIP.toString()))
+                     ? "PROXY"
+                     : "DIRECT";
+  {
+    int schemeEnd = url.indexOf("://");
+    if (schemeEnd >= 0) {
+      int hostStart = schemeEnd + 3;
+      int hostEnd   = url.indexOf('/', hostStart);
+      if (hostEnd < 0) hostEnd = url.length();
+      artLastHost = url.substring(hostStart, hostEnd);
+    } else {
+      artLastHost = "?";
+    }
+  }
+  artLastStatus = 0;
+  artLastNote   = "";
+
   Serial.println("[Art] ------------------------------------");
-  Serial.printf("[Art] Resolved URL: %s\n", url.c_str());
+  Serial.printf("[Art] Route=%s Host=%s", artLastRoute.c_str(),
+                artLastHost.c_str());
+  Serial.printf("\n[Art] Resolved URL: %s\n", url.c_str());
 
   File artFile = LittleFS.open(ART_FILE_PATH, FILE_WRITE);
   if (!artFile) {
@@ -1161,6 +1191,7 @@ void downloadArtwork() {
                   https ? "https" : "http");
 
     int status = http.GET();
+    artLastStatus = status;
     Serial.printf("[Art] HTTP status: %d\n", status);
 
     if (status == 301 || status == 302 || status == 303 || status == 307 ||
@@ -1182,6 +1213,7 @@ void downloadArtwork() {
     }
 
     if (status != 200) {
+      artLastNote = "http " + String(status);
       Serial.printf("[Art] Download failed: %s\n",
                     HTTPClient::errorToString(status).c_str());
       http.end();
@@ -1229,6 +1261,9 @@ void downloadArtwork() {
 
     Serial.printf("[Art] Wrote %u bytes to LittleFS\n", (unsigned)received);
     success = (received > 0);
+    if (success) {
+      artLastNote = String(received) + " bytes";
+    }
     break;
   }
 
@@ -1242,8 +1277,10 @@ void downloadArtwork() {
     // Partial or empty download: discard so a truncated JPEG is never drawn.
     LittleFS.remove(ART_FILE_PATH);
     if (wroteAnyBytes) {
+      artLastNote = "partial";
       Serial.println("[Art] Partial download, cached file removed.");
     } else {
+      if (artLastNote.length() == 0) artLastNote = "no data";
       Serial.println("[Art] Nothing downloaded.");
     }
   }
@@ -1619,60 +1656,72 @@ int drawWrappedText(const String &text, int x, int y, int maxWidth,
   return lineY;
 }
 
-// Draws the artwork-area placeholder.
+// Draws the artwork-area placeholder as a large-font status panel.
 //
-// Shows the RESOLVED artwork URL - the address actually being fetched, not the
-// raw value from the response. The two differ for a relative path, where the
-// response gives "/getaa?s=1&u=..." and the firmware must prepend the
-// speaker's scheme, host and port. Displaying the resolved form is what makes a
-// bad host, port or path visible on the screen.
+// The route, host and HTTP status are drawn in font 2 (16px) so they can be
+// read from a photograph of the display, with the full URLs beneath in font 1
+// for detail. A font-1-only panel was unreadable in practice.
 void drawArtworkPlaceholder() {
   tft.fillRect(ART_AREA_X, ART_AREA_Y, ART_AREA_W, ART_AREA_H, TFT_BLACK);
 
-  if (currentArtUri.length() > 0) {
-    String resolved = resolveArtworkUrl(currentArtUri);
+  if (currentArtUri.length() == 0) {
+    // Nothing in the response at all.
+    int cx = ART_AREA_X + ART_AREA_W / 2;
+    int cy = ART_AREA_Y + ART_AREA_H / 2;
 
+    tft.fillCircle(cx, cy, 36, TFT_DARKGREY);
+    tft.fillCircle(cx, cy, 20, 0x18A0);
+    tft.fillCircle(cx, cy, 6, TFT_DARKGREY);
+
+    tft.setTextColor(0xFF8C00);
+    tft.setTextFont(2);
+    tft.setTextDatum(TC_DATUM);
+    tft.drawString("NO ART URL", cx, cy + 24);
     tft.setTextFont(1);
-    tft.setTextColor(0xBDF7);
-    tft.setTextDatum(TL_DATUM);
-
-    // Label which form is being shown, and note if resolution failed.
-    tft.drawString(resolved.length() > 0 ? "Fetching (resolved):"
-                                         : "UNRESOLVED - no speaker IP",
-                   ART_AREA_X + 4, ART_AREA_Y + 4);
-
-    int nextY = drawWrappedText(resolved, ART_AREA_X + 4, ART_AREA_Y + 16,
-                                ART_AREA_W - 8, 5, 1);
-
-    // Always show the raw value too, so both forms can be compared on screen.
     tft.setTextColor(0x6E6E);
-    tft.drawString("from SOAP:", ART_AREA_X + 4,
-                   nextY < ART_AREA_Y + ART_AREA_H - 12
-                       ? nextY
-                       : ART_AREA_Y + ART_AREA_H - 12);
-    tft.setTextColor(0x808080);
-    drawWrappedText(currentArtUri, ART_AREA_X + 4,
-                    (nextY < ART_AREA_Y + ART_AREA_H - 12
-                         ? nextY
-                         : ART_AREA_Y + ART_AREA_H - 12) + 10,
-                    ART_AREA_W - 8, 2, 1);
+    tft.drawString("none in GetPositionInfo", cx, cy + 42);
     return;
   }
 
-  // No URL at all in the response: fall back to the disc motif and say why.
-  int cx = ART_AREA_X + ART_AREA_W / 2;
-  int cy = ART_AREA_Y + ART_AREA_H / 2;
+  String resolved = resolveArtworkUrl(currentArtUri);
 
-  tft.fillCircle(cx, cy, 36, TFT_DARKGREY);
-  tft.fillCircle(cx, cy, 20, 0x18A0);
-  tft.fillCircle(cx, cy, 6, TFT_DARKGREY);
-
-  tft.setTextColor(0xFF8C00);
-  tft.setTextFont(1);
+  // ---- Large-font summary -------------------------------------------
   tft.setTextDatum(TC_DATUM);
-  tft.drawString("no artwork URL", cx, cy + 26);
+  tft.setTextFont(2);
+
+  // Route line.
+  tft.setTextColor(artLastRoute == "DIRECT" ? 0x9CFF9C : 0xFFD08C);
+  tft.drawString(artLastRoute.length() > 0 ? artLastRoute : "?", 120,
+                 ART_AREA_Y + 14);
+
+  // Status line: HTTP code, or the reason there is no code.
+  String statusText = (artLastStatus > 0) ? String(artLastStatus) : artLastNote;
+  if (statusText.length() == 0) statusText = "...";
+  tft.setTextColor(artLastStatus == 200 ? 0x9CFF9C : 0xFF8080);
+  tft.drawString(statusText, 120, ART_AREA_Y + 36);
+
+  // ---- Small-font detail --------------------------------------------
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(1);
+
   tft.setTextColor(0x6E6E);
-  tft.drawString("in GetPositionInfo", cx, cy + 38);
+  tft.drawString("host:", ART_AREA_X + 4, ART_AREA_Y + 52);
+  tft.setTextColor(0xBDF7);
+  tft.drawString(ellipsize(artLastHost, 180, 1), ART_AREA_X + 40,
+                 ART_AREA_Y + 52);
+
+  tft.setTextColor(0x6E6E);
+  tft.drawString("url:", ART_AREA_X + 4, ART_AREA_Y + 64);
+  tft.setTextColor(0x808080);
+  tft.drawString(ellipsize(resolved.length() > 0 ? resolved : currentArtUri,
+                           ART_AREA_W - 40, 1),
+                 ART_AREA_X + 40, ART_AREA_Y + 64);
+
+  tft.setTextColor(0x6E6E);
+  tft.drawString("soap:", ART_AREA_X + 4, ART_AREA_Y + 74);
+  tft.setTextColor(0x707070);
+  tft.drawString(ellipsize(currentArtUri, ART_AREA_W - 40, 1),
+                 ART_AREA_X + 40, ART_AREA_Y + 74);
 }
 
 // Clears the display and draws the placeholder for the idle screen.
