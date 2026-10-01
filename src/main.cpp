@@ -35,7 +35,7 @@
 // ---------------------------------------------------------------------------
 
 // Application version. Incremented by 0.01 on each build.
-#define APP_VERSION "0.37"
+#define APP_VERSION "0.39"
 
 // ---------------------------------------------------------------------------
 // WiFi Configuration
@@ -482,15 +482,85 @@ String sanitizeArtist(const String &raw) {
   return raw;
 }
 
+// Converts a single hex digit to its value, or -1 if not a hex digit.
+int hexDigitValue(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
+// Percent-decodes a URL component ("%3a%2f%2f" -> "://").
+String urlDecode(const String &in) {
+  String out;
+  out.reserve(in.length());
+
+  for (unsigned int i = 0; i < in.length(); i++) {
+    char c = in.charAt(i);
+
+    if (c == '%' && i + 2 < in.length()) {
+      int hi = hexDigitValue(in.charAt(i + 1));
+      int lo = hexDigitValue(in.charAt(i + 2));
+
+      if (hi >= 0 && lo >= 0) {
+        out += (char)((hi << 4) | lo);
+        i += 2;
+        continue;
+      }
+    }
+
+    out += c;
+  }
+
+  return out;
+}
+
+// Pulls the "u=" query parameter out of a URL and percent-decodes it.
+//
+// A speaker-proxied artwork path looks like:
+//     /getaa?s=1&u=http%3a%2f%2fi.scdn.co%2fimage%2f...
+// The u= value is the ORIGINAL upstream resource, which is often a real
+// absolute https URL that can be fetched directly instead of being proxied
+// through the speaker. Returns an empty string when there is no usable u=.
+String extractUrlParamU(const String &url) {
+  int idx = 0;
+  bool found = false;
+
+  // Match "u=" only at the start of the string or after ? or &, so parameters
+  // such as "sid=" are not mistaken for it.
+  while ((idx = url.indexOf("u=", idx)) >= 0) {
+    if (idx == 0 || url.charAt(idx - 1) == '?' || url.charAt(idx - 1) == '&') {
+      found = true;
+      break;
+    }
+    idx += 2;
+  }
+
+  if (!found) return String();
+
+  String value = url.substring(idx + 2);
+
+  int amp = value.indexOf('&');
+  if (amp >= 0) value = value.substring(0, amp);
+
+  return urlDecode(value);
+}
+
 // Resolves an artwork URL taken from the GetPositionInfo response.
 //
 // upnp:albumArtURI arrives in two forms:
 //
 //   Relative path  e.g. /getaa?s=1&u=...
-//       Served by the speaker itself, so the speaker's address AND its HTTP
-//       port must be prepended: http://192.168.1.50:1400/getaa?s=1&u=...
-//       Omitting :1400 would request port 80, where the speaker serves
-//       nothing, and the download would fail with a connection error.
+//       Served by the speaker. The "u=" parameter carries the original
+//       upstream resource, percent-encoded. When that decodes to an absolute
+//       http(s) URL - typical for streaming services such as Spotify, where
+//       it looks like https://i.scdn.co/image/... - it is fetched DIRECTLY,
+//       which avoids a round trip through the speaker entirely. If it decodes
+//       to an internal Sonos scheme (x-sonos-http:, x-file-cifs:,
+//       x-rincon-mp3radio:) it is not directly fetchable and the speaker must
+//       proxy it, so the address becomes:
+//           http://<speaker-ip>:1400/getaa?s=1&u=...
+//       Port 1400 is required; the speaker serves nothing on port 80.
 //
 //   Absolute URL   e.g. https://i.scdn.co/image/...
 //       Used as-is. Common with some streaming services and internet radio.
@@ -501,7 +571,7 @@ String resolveArtworkUrl(const String &raw) {
   url.trim();
   if (url.length() == 0) return String();
 
-  // Absolute URL: use it unchanged.
+  // Already absolute: nothing to do.
   if (url.startsWith("http://") || url.startsWith("https://")) {
     return url;
   }
@@ -511,13 +581,26 @@ String resolveArtworkUrl(const String &raw) {
     return "http:" + url;
   }
 
-  // Relative path: the speaker must be known to build an absolute address.
+  // Relative path. Try to recover the upstream resource so the request can be
+  // made directly rather than through the speaker.
+  String upstream = extractUrlParamU(url);
+  if (upstream.startsWith("http://") || upstream.startsWith("https://")) {
+    Serial.printf("[Art] Using direct upstream URL (no speaker proxy): %s\n",
+                  upstream.c_str());
+    return upstream;
+  }
+
+  if (upstream.length() > 0) {
+    Serial.printf("[Art] u= is not fetchable directly (%s), proxying via speaker.\n",
+                  upstream.c_str());
+  }
+
+  // No usable upstream, so the speaker must proxy it.
   if (activeSonosIP[0] == 0) return String();
 
   // Port 1400 is the speaker's HTTP port; it serves both the AVTransport SOAP
   // control endpoint and /getaa.
-  String base = "http://" + activeSonosIP.toString() + ":" +
-                String(SONOS_PORT);
+  String base = "http://" + activeSonosIP.toString() + ":" + String(SONOS_PORT);
 
   if (url.startsWith("/")) {
     return base + url;
