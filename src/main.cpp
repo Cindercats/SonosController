@@ -35,7 +35,7 @@
 // ---------------------------------------------------------------------------
 
 // Application version. Incremented by 0.01 on each build.
-#define APP_VERSION "0.43"
+#define APP_VERSION "0.53"
 
 // ---------------------------------------------------------------------------
 // WiFi Configuration
@@ -406,6 +406,9 @@ String resolveTrackField(const String &metaData, const char *didlTag,
 }
 
 // Reverses the XML entities Sonos emits inside text nodes.
+//
+// Single pass on purpose: "&" is replaced last so that an escaped literal such
+// as "&amp;lt;" is not collapsed into a real "<" by the "&lt;" rule.
 String xmlUnescape(const String &in) {
   String out = in;
   out.replace("&lt;", "<");
@@ -413,6 +416,29 @@ String xmlUnescape(const String &in) {
   out.replace("&quot;", "\"");
   out.replace("&apos;", "'");
   out.replace("&amp;", "&");  // must run last
+  return out;
+}
+
+// Unescapes repeatedly until no entity remains.
+//
+// Needed because Sonos escapes the DIDL-Lite blob in <CurrentTrackMetaData>
+// TWICE: the "&" that separates the /getaa query parameters is written as
+// "&amp;" inside the DIDL, and the SOAP envelope then escapes the whole blob
+// again, so the wire format carries "&amp;amp;u=". One pass therefore leaves a
+// literal "&amp;" in the artwork URI, the speaker stops seeing the "u" parameter
+// and replies 404 instead of the JPEG.
+//
+// Repeats only while a pass still changes the string, so text that was escaped
+// just once (or not at all) is returned untouched by the extra passes.
+String xmlUnescapeDeep(const String &in, int maxPasses = 3) {
+  String out = in;
+
+  for (int pass = 0; pass < maxPasses; pass++) {
+    String next = xmlUnescape(out);
+    if (next == out) break;  // nothing left to decode
+    out = next;
+  }
+
   return out;
 }
 
@@ -1132,6 +1158,64 @@ String artLastRoute;            // "DIRECT", "PROXY" or "UNRESOLVED"
 String artLastHost;             // host the request went to
 String artLastNote;             // short reason text
 
+// A write-only Stream that forwards everything into an open LittleFS file,
+// capped at a maximum size.
+//
+// Used as the destination for HTTPClient::writeToStream(), which is the
+// framework's own de-chunking read path. Buffering is 512 bytes, so the body is
+// never held in RAM in full.
+class FileSink : public Stream {
+ public:
+  // "_capLimit": a plain "maxBytes" is safer than _max, because <windows.h> style
+  // headers define max() as a macro and it would rewrite the identifier.
+  FileSink(File &file, size_t capLimit) : _file(file), _capLimit(capLimit) {}
+
+  // Stream interface. Only writes are ever used by writeToStream(); the read
+  // side is a sink and returns nothing, which is what Print expects.
+  int available() override { return 0; }
+  int read() override { return -1; }
+  int peek() override { return -1; }
+  void flush() {}
+
+  size_t write(uint8_t c) override {
+    if (_written >= _capLimit) return 0;  // full: report a short write
+    if (_file.write(&c, 1) != 1) return 0;
+    _written++;
+    return 1;
+  }
+
+  size_t write(const uint8_t *data, size_t len) override {
+    size_t room = (_written < _capLimit) ? (_capLimit - _written) : 0;
+    if (len > room) len = room;
+    if (len == 0) return 0;
+
+    size_t n = _file.write(data, len);
+
+    // Track the final two bytes here rather than seeking back to read them: the
+    // cache is opened FILE_WRITE ("w"), so reading from it is not dependable.
+    for (size_t i = 0; i < n; i++) {
+      _prev = _last;
+      _last = data[i];
+    }
+
+    _written += n;
+    return n;
+  }
+
+  size_t written() const { return _written; }
+
+  // True when the stream ended on the JPEG end-of-image marker (0xFFD9), which
+  // proves the body arrived complete.
+  bool endedWithEoi() const { return _written >= 2 && _prev == 0xFF && _last == 0xD9; }
+
+ private:
+  File   &_file;
+  size_t  _capLimit;
+  size_t  _written = 0;
+  uint8_t _prev    = 0;
+  uint8_t _last    = 0;
+};
+
 // Attempts one artwork URL, following redirects, and writes any bytes received
 // into the open file. Returns true when at least one byte was written.
 static bool fetchArtworkFrom(const String &startUrl, File &artFile,
@@ -1212,35 +1296,42 @@ static bool fetchArtworkFrom(const String &startUrl, File &artFile,
     }
 
     // Stream the body straight to LittleFS to keep RAM use low.
-    WiFiClient *stream = http.getStreamPtr();
-    uint8_t     chunk[1024];
-    int         available;
+    //
+    // The body MUST be read through HTTPClient::getStream() and written with
+    // writeToStream(), not pulled off getStreamPtr() directly. The speaker
+    // answers with "Transfer-Encoding: chunked" and sends no Content-Length, so
+    // the raw socket also delivers the chunk-size lines ("1000\r\n" etc).
+    // Copying those verbatim stores chunk headers inside the JPEG and the
+    // decoder then fails on a file that is otherwise a valid download - which
+    // is what produced "getJpgSize failed" after a reported HTTP 200.
+    // writeToStream() is the framework's own de-chunking path.
+    FileSink sink(artFile, ART_MAX_SIZE);
+    int       copied = http.writeToStream(&sink);
 
-    while (http.connected() && (available = stream->available()) > 0) {
-      // Enforce the cap even when the server sent no usable Content-Length,
-      // otherwise a bad response could fill the whole filesystem.
-      if (receivedOut >= ART_MAX_SIZE) {
-        Serial.println("[Art]   Exceeded size cap mid-stream, aborting.");
-        break;
-      }
+    if (copied < 0) {
+      Serial.printf("[Art]   Body read failed: %d\n", copied);
+      artLastNote = "read error";
+      http.end();
+      break;
+    }
 
-      int toRead = available;
-      if (toRead > (int)sizeof(chunk)) toRead = sizeof(chunk);
-      if ((size_t)toRead > ART_MAX_SIZE - receivedOut) {
-        toRead = (int)(ART_MAX_SIZE - receivedOut);
-      }
+    receivedOut = sink.written();
+    wroteAny    = (receivedOut > 0);
 
-      int bytes = stream->readBytes(chunk, toRead);
-      if (bytes <= 0) break;
+    Serial.printf("[Art]   Wrote %u bytes\n", (unsigned)receivedOut);
 
-      artFile.write(chunk, bytes);
-      receivedOut += bytes;
-      wroteAny = true;
+    // A JPEG must end with the EOI marker (0xFFD9); anything shorter is a
+    // truncated body that would render as noise, so treat it as a failure
+    // rather than caching a broken file.
+    if (wroteAny && !sink.endedWithEoi()) {
+      Serial.println("[Art]   Body is not a complete JPEG (no EOI marker).");
+      artLastNote = "truncated";
+      http.end();
+      break;
     }
 
     http.end();
 
-    Serial.printf("[Art]   Wrote %u bytes\n", (unsigned)receivedOut);
     success = (receivedOut > 0);
     break;
   }
@@ -1520,14 +1611,21 @@ void pollSonos() {
   // ---- Artwork ----------------------------------------------------------
   // Read from the same metadata blob, matched by local name so upnp:, r: and
   // unprefixed forms all match.
+  //
+  // xmlUnescapeDeep() is required here, not the single pass used for the text
+  // fields: the artwork URI carries its own query string ("?s=1&u=..."), and that
+  // "&" is escaped a second time by the SOAP envelope. Unescaping only once
+  // leaves "&amp;" in the URL, the speaker cannot find the "u" parameter and
+  // answers 404 - which is exactly what the PROXY 404 on the diagnostic panel
+  // was reporting.
   String artUri;
 
   if (metaData.length() > 0) {
-    artUri = extractByLocalName(metaData, "albumArtURI");
+    artUri = xmlUnescapeDeep(extractByLocalName(metaData, "albumArtURI"));
   }
 
   if (artUri.length() == 0) {
-    artUri = xmlUnescape(extractByLocalName(positionBody, "CurrentTrackArtImage"));
+    artUri = xmlUnescapeDeep(extractByLocalName(positionBody, "CurrentTrackArtImage"));
   }
 
   // Last resort: some local/native content exposes the image through <res>.
@@ -1535,7 +1633,7 @@ void pollSonos() {
   // AUDIO STREAM (x-file-cifs://, x-rincon-mp3radio:// ...) and downloading
   // that as artwork would waste bandwidth and always fail to decode.
   if (artUri.length() == 0 && metaData.length() > 0) {
-    String resUri = xmlUnescape(extractByLocalName(metaData, "res"));
+    String resUri = xmlUnescapeDeep(extractByLocalName(metaData, "res"));
     resUri.trim();
     if (resUri.endsWith(".jpg") || resUri.endsWith(".jpeg") ||
         resUri.endsWith(".png") || resUri.endsWith(".gif")) {
@@ -1731,7 +1829,9 @@ void drawArtworkPlaceholder() {
     tft.fillCircle(cx, cy, 20, 0x18A0);
     tft.fillCircle(cx, cy, 6, TFT_DARKGREY);
 
-    tft.setTextColor(0xFF8C00);
+    // RGB565 (TFT_eSPI takes a 16-bit colour; 0xFF8C00 as a 24-bit literal would
+    // silently truncate to 0x8C00 and lose the red component).
+    tft.setTextColor(0xFD20);  // dark orange
     tft.setTextFont(2);
     tft.setTextDatum(TC_DATUM);
     tft.drawString("NO ART URL", cx, cy + 24);
@@ -1770,14 +1870,14 @@ void drawArtworkPlaceholder() {
 
   tft.setTextColor(0x6E6E);
   tft.drawString("url:", ART_AREA_X + 4, ART_AREA_Y + 64);
-  tft.setTextColor(0x808080);
+  tft.setTextColor(0xA800);  // mid grey
   tft.drawString(ellipsize(resolved.length() > 0 ? resolved : currentArtUri,
                            ART_AREA_W - 40, 1),
                  ART_AREA_X + 40, ART_AREA_Y + 64);
 
   tft.setTextColor(0x6E6E);
   tft.drawString("soap:", ART_AREA_X + 4, ART_AREA_Y + 74);
-  tft.setTextColor(0x707070);
+  tft.setTextColor(0x9C48);  // dim grey
   tft.drawString(ellipsize(currentArtUri, ART_AREA_W - 40, 1),
                  ART_AREA_X + 40, ART_AREA_Y + 74);
 }
