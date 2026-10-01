@@ -35,7 +35,7 @@
 // ---------------------------------------------------------------------------
 
 // Application version. Incremented by 0.01 on each build.
-#define APP_VERSION "0.33"
+#define APP_VERSION "0.35"
 
 // ---------------------------------------------------------------------------
 // WiFi Configuration
@@ -1025,7 +1025,13 @@ void downloadArtwork() {
     return;
   }
 
+  // Both clients are declared here, outside the redirect loop, and MUST live
+  // for the whole request. HTTPClient keeps a reference to whichever client it
+  // was given, so a client declared inside the loop's scope would be destroyed
+  // while http.getStreamPtr() still pointed at it.
   WiFiClientSecure secureClient;
+  WiFiClient       plainClient;
+
   bool               wroteAnyBytes = false;
   bool               success       = false;
   int                redirectCount = 0;
@@ -1048,7 +1054,6 @@ void downloadArtwork() {
     if (https) {
       http.begin(secureClient, url);
     } else {
-      WiFiClient plainClient;
       http.begin(plainClient, url);
     }
 
@@ -1217,6 +1222,9 @@ void renderArtwork() {
   JRESULT result = TJpgDec.drawFsJpg(destX, destY, ART_FILE_PATH, LittleFS);
   if (result != JDR_OK) {
     Serial.printf("[Art] drawFsJpg failed: %d\n", (int)result);
+    // The file decoded as JPEG headers but could not be rendered; show the
+    // URL so the source of the bad image is visible on screen.
+    drawArtworkPlaceholder();
   } else {
     Serial.println("[Art] Render complete.");
   }
@@ -1327,10 +1335,19 @@ void pollSonos() {
     artUri = xmlUnescape(extractByLocalName(positionBody, "CurrentTrackArtImage"));
   }
 
-  // Last resort: some services only expose a <res> element, which holds the
-  // image for local/native content.
+  // Last resort: some local/native content exposes the image through <res>.
+  // Guarded by an image-extension check, because <res> normally holds the
+  // AUDIO STREAM (x-file-cifs://, x-rincon-mp3radio:// ...) and downloading
+  // that as artwork would waste bandwidth and always fail to decode.
   if (artUri.length() == 0 && metaData.length() > 0) {
-    artUri = xmlUnescape(extractByLocalName(metaData, "res"));
+    String resUri = xmlUnescape(extractByLocalName(metaData, "res"));
+    resUri.trim();
+    if (resUri.endsWith(".jpg") || resUri.endsWith(".jpeg") ||
+        resUri.endsWith(".png") || resUri.endsWith(".gif")) {
+      artUri = resUri;
+    } else if (resUri.length() > 0) {
+      Serial.println("[Sonos] <res> is not an image, ignoring for artwork.");
+    }
   }
 
   artUri.trim();
@@ -1464,20 +1481,76 @@ void drawVersion() {
   tft.drawString(String("v") + APP_VERSION, VER_X, VER_Y);
 }
 
-// Draws a vinyl record motif when no artwork is available.
+// Draws text wrapped to the given width, at most maxLines lines.
+// Returns the Y position just below the last line drawn.
+int drawWrappedText(const String &text, int x, int y, int maxWidth,
+                    int maxLines, uint8_t font) {
+  int lineY = y;
+  int start = 0;
+
+  while (start < (int)text.length() && maxLines > 0) {
+    int len = text.length() - start;
+
+    // Shrink until the remainder fits the available width.
+    while (len > 0 &&
+           tft.textWidth(text.substring(start, start + len), font) > maxWidth) {
+      len--;
+    }
+    if (len <= 0) break;
+
+    tft.drawString(text.substring(start, start + len), x, lineY);
+
+    start += len;
+    lineY += tft.fontHeight(font);
+    maxLines--;
+  }
+
+  return lineY;
+}
+
+// Draws the artwork-area placeholder.
+//
+// When the track carries an artwork URL, that URL is shown on screen instead
+// of the generic disc. The URL comes straight out of the GetPositionInfo
+// response, so reading it on the display is the quickest way to confirm that
+// extraction produced a usable address and to see which host/port/path the
+// firmware is being asked to fetch.
 void drawArtworkPlaceholder() {
+  tft.fillRect(ART_AREA_X, ART_AREA_Y, ART_AREA_W, ART_AREA_H, TFT_BLACK);
+
+  if (currentArtUri.length() > 0) {
+    tft.setTextFont(1);
+    tft.setTextColor(0xBDF7);
+    tft.setTextDatum(TL_DATUM);
+
+    tft.drawString("Artwork URL:", ART_AREA_X + 4, ART_AREA_Y + 4);
+
+    int nextY = drawWrappedText(currentArtUri, ART_AREA_X + 4,
+                                ART_AREA_Y + 16, ART_AREA_W - 8, 7, 1);
+
+    // If the URL did not fit, note that it was truncated.
+    tft.setTextColor(0x6E6E);
+    tft.drawString("(truncated)", ART_AREA_X + 4,
+                   nextY < ART_AREA_Y + ART_AREA_H - 10
+                       ? nextY
+                       : ART_AREA_Y + ART_AREA_H - 10);
+    return;
+  }
+
+  // No URL at all in the response: fall back to the disc motif and say why.
   int cx = ART_AREA_X + ART_AREA_W / 2;
   int cy = ART_AREA_Y + ART_AREA_H / 2;
 
-  tft.fillRect(ART_AREA_X, ART_AREA_Y, ART_AREA_W, ART_AREA_H, TFT_BLACK);
   tft.fillCircle(cx, cy, 36, TFT_DARKGREY);
   tft.fillCircle(cx, cy, 20, 0x18A0);
   tft.fillCircle(cx, cy, 6, TFT_DARKGREY);
 
-  tft.setTextColor(0xBDF7);
+  tft.setTextColor(0xFF8C00);
   tft.setTextFont(1);
   tft.setTextDatum(TC_DATUM);
-  tft.drawString("No artwork", cx, cy + 26);
+  tft.drawString("no artwork URL", cx, cy + 26);
+  tft.setTextColor(0x6E6E);
+  tft.drawString("in GetPositionInfo", cx, cy + 38);
 }
 
 // Clears the display and draws the placeholder for the idle screen.
