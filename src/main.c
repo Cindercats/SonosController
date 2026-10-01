@@ -1,0 +1,1 @@
+// Empty placeholder - active firmware implementation is in main.cpp

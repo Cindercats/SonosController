@@ -1,0 +1,11 @@
+.pio
+.vscode/.browse.c_cpp_properties.db*
+.vscode/c_cpp_properties.json
+.vscode/launch.json
+.vscode/ipch
+
+# Local credentials - never commit these
+src/secrets.h
+
+# PlatformIO auto-generated
+sdkconfig.*
