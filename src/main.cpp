@@ -35,7 +35,7 @@
 // ---------------------------------------------------------------------------
 
 // Application version. Incremented by 0.01 on each build.
-#define APP_VERSION "0.41"
+#define APP_VERSION "0.43"
 
 // ---------------------------------------------------------------------------
 // WiFi Configuration
@@ -566,47 +566,79 @@ String extractUrlParamU(const String &url) {
 //       Used as-is. Common with some streaming services and internet radio.
 //
 // Protocol-relative "//host/path" is also accepted.
-String resolveArtworkUrl(const String &raw) {
-  String url = raw;
-  url.trim();
-  if (url.length() == 0) return String();
-
-  // Already absolute: nothing to do.
-  if (url.startsWith("http://") || url.startsWith("https://")) {
-    return url;
-  }
-
-  // Protocol-relative: assume http, since the speaker is local.
-  if (url.startsWith("//")) {
-    return "http:" + url;
-  }
-
-  // Relative path. Try to recover the upstream resource so the request can be
-  // made directly rather than through the speaker.
-  String upstream = extractUrlParamU(url);
-  if (upstream.startsWith("http://") || upstream.startsWith("https://")) {
-    Serial.printf("[Art] Using direct upstream URL (no speaker proxy): %s\n",
-                  upstream.c_str());
-    return upstream;
-  }
-
-  if (upstream.length() > 0) {
-    Serial.printf("[Art] u= is not fetchable directly (%s), proxying via speaker.\n",
-                  upstream.c_str());
-  }
-
-  // No usable upstream, so the speaker must proxy it.
+// Builds the speaker-proxied address for a relative /getaa path.
+// Returns an empty string when the speaker is not known.
+String buildSpeakerProxyUrl(const String &raw) {
   if (activeSonosIP[0] == 0) return String();
 
   // Port 1400 is the speaker's HTTP port; it serves both the AVTransport SOAP
-  // control endpoint and /getaa.
+  // control endpoint and /getaa. Port 80 serves nothing.
   String base = "http://" + activeSonosIP.toString() + ":" + String(SONOS_PORT);
 
-  if (url.startsWith("/")) {
-    return base + url;
+  if (raw.startsWith("/")) return base + raw;
+  return base + "/" + raw;
+}
+
+// Produces the candidate URLs to try, in order, for an artwork reference.
+//
+// upnp:albumArtURI arrives in two forms:
+//
+//   Relative path  e.g. /getaa?s=1&u=...
+//       Served by the speaker. Two routes are possible:
+//         (a) direct - the "u=" parameter carries the original upstream
+//             resource, percent-encoded. When it decodes to an absolute http(s)
+//             URL it is fetched straight from the CDN.
+//         (b) proxied - http://<speaker-ip>:1400/getaa?s=1&u=...
+//
+//       Both are returned, direct first, because neither is reliable on its
+//       own. Streaming CDNs such as Spotify's i.scdn.co commonly reject direct
+//       requests with 403, or answer 302 to a short-lived signed URL, precisely
+//       because the speaker is expected to supply the right headers. Meanwhile
+//       the proxy route is slower and depends on the speaker being reachable.
+//       Trying direct first and falling back to the proxy covers both cases
+//       without needing to know which service is playing.
+//
+//   Absolute URL   e.g. https://i.scdn.co/image/...
+//       Only one candidate: use it as-is.
+//
+// Protocol-relative "//host/path" is also accepted.
+int artworkUrlCandidates(const String &raw, String out[], int maxOut) {
+  int count = 0;
+
+  String url = raw;
+  url.trim();
+  if (url.length() == 0) return 0;
+
+  if (count < maxOut) out[count++] = url;  // already absolute
+
+  if (url.startsWith("//") && count < maxOut) {
+    out[count++] = "http:" + url;
   }
 
-  return base + "/" + url;
+  if (!url.startsWith("http://") && !url.startsWith("https://") &&
+      !url.startsWith("//")) {
+    // Relative path: offer the direct upstream first, then the speaker proxy.
+    String upstream = extractUrlParamU(url);
+    if ((upstream.startsWith("http://") || upstream.startsWith("https://")) &&
+        count < maxOut) {
+      out[count++] = upstream;
+    }
+
+    String proxy = buildSpeakerProxyUrl(url);
+    if (proxy.length() > 0 && count < maxOut) {
+      out[count++] = proxy;
+    }
+  }
+
+  return count;
+}
+
+// Returns the single best-guess URL, used for on-screen display only.
+// The real fetch path uses artworkUrlCandidates() and tries each in turn.
+String resolveArtworkUrl(const String &raw) {
+  String candidates[2];
+  int    count = artworkUrlCandidates(raw, candidates, 2);
+  return (count > 0) ? candidates[0] : String();
 }
 
 // Resolves a Location header against the URL it came from, so that relative
@@ -1100,71 +1132,21 @@ String artLastRoute;            // "DIRECT", "PROXY" or "UNRESOLVED"
 String artLastHost;             // host the request went to
 String artLastNote;             // short reason text
 
-// Downloads the current track artwork into LittleFS.
-//
-// Source URL: the <upnp:albumArtURI> value read from <CurrentTrackMetaData>,
-// typically /getaa?s=1&u=<url-encoded upstream URI> or an absolute https URL.
-// resolveArtworkUrl() may route it directly to the upstream host or through
-// the speaker on port 1400. Redirects are followed manually, up to
-// HTTP_MAX_REDIRECTS hops.
-//
-// Verbose logging is emitted throughout to assist debugging.
-void downloadArtwork() {
-  if (currentArtUri.length() == 0) return;
+// Attempts one artwork URL, following redirects, and writes any bytes received
+// into the open file. Returns true when at least one byte was written.
+static bool fetchArtworkFrom(const String &startUrl, File &artFile,
+                             size_t &receivedOut) {
+  receivedOut       = 0;
+  bool wroteAny      = false;
+  bool success       = false;
+  int  redirectCount = 0;
+  String url         = startUrl;
 
-  String url = resolveArtworkUrl(currentArtUri);
-  if (url.length() == 0) {
-    artLastStatus = 0;
-    artLastRoute  = "UNRESOLVED";
-    artLastNote   = "no speaker IP";
-    Serial.println("[Art] Could not resolve artwork URL.");
-    return;
-  }
-
-  if (url == cachedArtUrl) {
-    artNeedsRender = true;  // already cached on disk
-    return;
-  }
-
-  // Record the route and host for the on-screen panel.
-  artLastRoute = (url.startsWith("http://" + activeSonosIP.toString()))
-                     ? "PROXY"
-                     : "DIRECT";
-  {
-    int schemeEnd = url.indexOf("://");
-    if (schemeEnd >= 0) {
-      int hostStart = schemeEnd + 3;
-      int hostEnd   = url.indexOf('/', hostStart);
-      if (hostEnd < 0) hostEnd = url.length();
-      artLastHost = url.substring(hostStart, hostEnd);
-    } else {
-      artLastHost = "?";
-    }
-  }
-  artLastStatus = 0;
-  artLastNote   = "";
-
-  Serial.println("[Art] ------------------------------------");
-  Serial.printf("[Art] Route=%s Host=%s", artLastRoute.c_str(),
-                artLastHost.c_str());
-  Serial.printf("\n[Art] Resolved URL: %s\n", url.c_str());
-
-  File artFile = LittleFS.open(ART_FILE_PATH, FILE_WRITE);
-  if (!artFile) {
-    Serial.println("[Art] Failed to open /art.jpg for writing.");
-    return;
-  }
-
-  // Both clients are declared here, outside the redirect loop, and MUST live
-  // for the whole request. HTTPClient keeps a reference to whichever client it
-  // was given, so a client declared inside the loop's scope would be destroyed
-  // while http.getStreamPtr() still pointed at it.
+  // Both clients live for the whole request. HTTPClient keeps a reference to
+  // whichever client it was given, so a client declared inside a narrower scope
+  // would be destroyed while http.getStreamPtr() still pointed at it.
   WiFiClientSecure secureClient;
   WiFiClient       plainClient;
-
-  bool               wroteAnyBytes = false;
-  bool               success       = false;
-  int                redirectCount = 0;
 
   while (redirectCount <= HTTP_MAX_REDIRECTS) {
     bool https = url.startsWith("https://");
@@ -1187,12 +1169,12 @@ void downloadArtwork() {
       http.begin(plainClient, url);
     }
 
-    Serial.printf("[Art] GET (attempt %d, %s)...\n", redirectCount + 1,
+    Serial.printf("[Art]   GET (hop %d, %s)...\n", redirectCount + 1,
                   https ? "https" : "http");
 
     int status = http.GET();
     artLastStatus = status;
-    Serial.printf("[Art] HTTP status: %d\n", status);
+    Serial.printf("[Art]   HTTP status: %d\n", status);
 
     if (status == 301 || status == 302 || status == 303 || status == 307 ||
         status == 308) {
@@ -1200,12 +1182,12 @@ void downloadArtwork() {
       http.end();
 
       if (location.length() == 0) {
-        Serial.println("[Art] Redirect with no Location header, giving up.");
+        Serial.println("[Art]   Redirect with no Location, giving up.");
         break;
       }
 
       String next = resolveRedirect(url, location);
-      Serial.printf("[Art] Redirect %d -> %s\n", status, next.c_str());
+      Serial.printf("[Art]   Redirect %d -> %s\n", status, next.c_str());
 
       url = next;
       redirectCount++;
@@ -1214,17 +1196,17 @@ void downloadArtwork() {
 
     if (status != 200) {
       artLastNote = "http " + String(status);
-      Serial.printf("[Art] Download failed: %s\n",
+      Serial.printf("[Art]   Failed: %s\n",
                     HTTPClient::errorToString(status).c_str());
       http.end();
       break;
     }
 
     int contentLength = http.getSize();
-    Serial.printf("[Art] Content-Length: %d\n", contentLength);
+    Serial.printf("[Art]   Content-Length: %d\n", contentLength);
 
     if (contentLength > ART_MAX_SIZE) {
-      Serial.println("[Art] Artwork too large, skipping.");
+      Serial.println("[Art]   Artwork too large, skipping.");
       http.end();
       break;
     }
@@ -1232,60 +1214,136 @@ void downloadArtwork() {
     // Stream the body straight to LittleFS to keep RAM use low.
     WiFiClient *stream = http.getStreamPtr();
     uint8_t     chunk[1024];
-    size_t      received = 0;
     int         available;
 
     while (http.connected() && (available = stream->available()) > 0) {
       // Enforce the cap even when the server sent no usable Content-Length,
       // otherwise a bad response could fill the whole filesystem.
-      if (received >= ART_MAX_SIZE) {
-        Serial.println("[Art] Exceeded size cap mid-stream, aborting.");
+      if (receivedOut >= ART_MAX_SIZE) {
+        Serial.println("[Art]   Exceeded size cap mid-stream, aborting.");
         break;
       }
 
       int toRead = available;
       if (toRead > (int)sizeof(chunk)) toRead = sizeof(chunk);
-      if ((size_t)toRead > ART_MAX_SIZE - received) {
-        toRead = (int)(ART_MAX_SIZE - received);
+      if ((size_t)toRead > ART_MAX_SIZE - receivedOut) {
+        toRead = (int)(ART_MAX_SIZE - receivedOut);
       }
 
       int bytes = stream->readBytes(chunk, toRead);
       if (bytes <= 0) break;
 
       artFile.write(chunk, bytes);
-      received += bytes;
-      wroteAnyBytes = true;
+      receivedOut += bytes;
+      wroteAny = true;
     }
 
     http.end();
 
-    Serial.printf("[Art] Wrote %u bytes to LittleFS\n", (unsigned)received);
-    success = (received > 0);
-    if (success) {
-      artLastNote = String(received) + " bytes";
-    }
+    Serial.printf("[Art]   Wrote %u bytes\n", (unsigned)receivedOut);
+    success = (receivedOut > 0);
     break;
+  }
+
+  if (!success && !wroteAny && artLastNote.length() == 0) {
+    artLastNote = "no data";
+  }
+
+  return success;
+}
+
+void downloadArtwork() {
+  if (currentArtUri.length() == 0) return;
+
+  String candidates[2];
+  int    count = artworkUrlCandidates(currentArtUri, candidates, 2);
+
+  if (count == 0) {
+    artLastStatus = 0;
+    artLastRoute  = "UNRESOLVED";
+    artLastHost   = "?";
+    artLastNote   = "no speaker IP";
+    Serial.println("[Art] Could not resolve artwork URL.");
+    return;
+  }
+
+  if (candidates[0] == cachedArtUrl) {
+    artNeedsRender = true;  // already cached on disk
+    return;
+  }
+
+  artLastStatus = 0;
+  artLastNote   = "";
+
+  Serial.println("[Art] ====================================");
+  Serial.printf("[Art] Candidate routes: %d\n", count);
+
+  File artFile = LittleFS.open(ART_FILE_PATH, FILE_WRITE);
+  if (!artFile) {
+    Serial.println("[Art] Failed to open /art.jpg for writing.");
+    return;
+  }
+
+  bool   success  = false;
+  bool   wroteAny = false;
+  size_t received = 0;
+  String usedUrl;
+
+  for (int i = 0; i < count; i++) {
+    String url = candidates[i];
+
+    // Label the route for the log and the on-screen panel.
+    artLastRoute = (url.startsWith("http://" + activeSonosIP.toString()))
+                       ? "PROXY"
+                       : "DIRECT";
+    {
+      int schemeEnd = url.indexOf("://");
+      if (schemeEnd >= 0) {
+        int hostStart = schemeEnd + 3;
+        int hostEnd   = url.indexOf('/', hostStart);
+        if (hostEnd < 0) hostEnd = url.length();
+        artLastHost = url.substring(hostStart, hostEnd);
+      } else {
+        artLastHost = "?";
+      }
+    }
+
+    Serial.printf("[Art] Trying route %d/%d: %s via %s\n", i + 1, count,
+                  artLastRoute.c_str(), artLastHost.c_str());
+    Serial.printf("[Art]   URL: %s\n", url.c_str());
+
+    received = 0;
+    if (fetchArtworkFrom(url, artFile, received)) {
+      success = true;
+      usedUrl = url;
+      break;
+    }
+
+    Serial.println("[Art]   Route yielded no data, trying next.");
+    artLastNote = "";
   }
 
   artFile.close();
 
   if (success) {
-    cachedArtUrl   = url;
+    cachedArtUrl   = usedUrl;
     artNeedsRender = true;
-    Serial.println("[Art] Cached successfully.");
+    artLastNote    = String(received) + " bytes";
+    Serial.printf("[Art] Cached via %s (%u bytes)\n", artLastRoute.c_str(),
+                  (unsigned)received);
   } else {
     // Partial or empty download: discard so a truncated JPEG is never drawn.
     LittleFS.remove(ART_FILE_PATH);
-    if (wroteAnyBytes) {
+    if (wroteAny) {
       artLastNote = "partial";
       Serial.println("[Art] Partial download, cached file removed.");
     } else {
       if (artLastNote.length() == 0) artLastNote = "no data";
-      Serial.println("[Art] Nothing downloaded.");
+      Serial.printf("[Art] All %d route(s) failed.\n", count);
     }
   }
 
-  Serial.println("[Art] ------------------------------------");
+  Serial.println("[Art] ====================================");
 }
 
 // TJpg_Decoder callback: pushes each decoded block into the artwork area.
