@@ -14,7 +14,35 @@
 #include <HTTPClient.h>
 #include <LittleFS.h>
 #include <TFT_eSPI.h>
-#include <TJpg_Decoder.h>
+
+// Artwork decoding uses TWO decoders, chosen by the JPEG's frame type.
+//
+// esp_jpg_decode() (ESP-IDF ROM TJpgDec) — BASELINE ONLY.
+//   TJpg_Decoder (ChaN's port) was removed earlier: its jd_prepare/jd_decomp symbols
+//   collide with the ones ESP-IDF's esp_jpg_decode defines internally, which faults
+//   with InstrFetchProhibited on the first decode. But esp_jpg_decode is a thin
+//   wrapper over that same ROM TJpgDec core (it calls jd_prepare/jd_decomp from
+//   rom/tjpgd.h), and TJpgDec rejects a progressive frame: jd_prepare returns
+//   JDR_FMT3 ("Not supported JPEG standard. May be a progressive JPEG image."),
+//   which esp_jpg_decode maps to ESP_FAIL. It is kept only for baseline images,
+//   where it is fast and streams the file straight from LittleFS.
+//
+// JPEGDEC (bitbank2) — handles PROGRESSIVE.
+//   Sonos serves progressive artwork for local library tracks, so something that can
+//   decode SOF2 is required. JPEGDEC has an explicit JPEG_MODE_PROGRESSIVE and, crucially,
+//   can be driven from a file handle rather than an in-memory buffer, so the ~138 KB
+//   image is never resident in RAM — the same low-RAM property that made esp_jpg_decode
+//   attractive, on a board with ~320 KB of DRAM and no PSRAM.
+//   Note it must be set to RGB565_BIG_ENDIAN for TFT_eSPI; see jpegdecDrawMCUs().
+//
+// See ARTWORK-ATTEMPTS.md for the full history of what was tried and rejected, and
+// README.md section 6 for how the pipeline fits together.
+#include <esp_jpg_decode.h>
+#include <JPEGDEC.h>
+#include <esp_heap_caps.h>
+
+// std::nothrow, used when allocating the JPEGDEC decoder.
+#include <new>
 
 // WiFi credentials and the fallback Sonos addresses live in secrets.h so they
 // are never committed. Copy src/secrets.example.h to src/secrets.h and fill
@@ -35,7 +63,7 @@
 // ---------------------------------------------------------------------------
 
 // Application version. Incremented by 0.01 on each build.
-#define APP_VERSION "0.53"
+#define APP_VERSION "0.81"
 
 // ---------------------------------------------------------------------------
 // WiFi Configuration
@@ -69,7 +97,15 @@ const char *SSDP_MULTICAST_IP = "239.255.255.250";
 #define ARTWORK_TIMEOUT_MS      8000
 #define SSDP_PACKET_SIZE        1024
 #define HTTP_MAX_REDIRECTS      3
-#define ART_MAX_SIZE            (256 * 1024)
+
+// Hard ceiling on waiting for a response body once the headers are in. Without
+// it, a socket that delivers nothing but also never disconnects spins forever.
+#define HTTP_BODY_READ_TIMEOUT_MS 2000
+
+// Artwork size cap. esp_jpg_decode needs the whole image resident in RAM (this
+// board has 320 KB internal RAM and no PSRAM), so anything beyond this cannot be
+// decoded and is discarded on download rather than cached.
+#define ART_MAX_SIZE            (150 * 1024)
 
 // ---------------------------------------------------------------------------
 // Hardware Pin Assignments
@@ -96,6 +132,16 @@ const char *SSDP_MULTICAST_IP = "239.255.255.250";
 #define SONOS_POLL_INTERVAL_MS 1000
 #define SSDP_RETRY_INTERVAL_MS 5000
 #define SSDP_KEEPALIVE_MS      60000
+
+// How long to wait before retrying an artwork download that failed, and how long
+// after a track change before the first attempt is made (so the speaker is not
+// hammered while it is still settling on the new track).
+#define ARTWORK_RETRY_INTERVAL_MS  5000
+#define ARTWORK_INITIAL_DELAY_MS   750
+
+// How often the other known speakers are probed while the active one is idle,
+// looking for whichever room is actually playing.
+#define SPEAKER_SCAN_INTERVAL_MS 5000
 #define IDLE_SCREEN_TIMEOUT_MS 10000
 #define TOAST_DURATION_MS      1600
 #define WIFI_RETRY_INTERVAL_MS 10000
@@ -163,6 +209,31 @@ const char *SSDP_MULTICAST_IP = "239.255.255.250";
 #define DIAG_SWAP_MS   2000
 
 // ---------------------------------------------------------------------------
+// Diagnostics capture
+// ---------------------------------------------------------------------------
+//
+// Why these exist: the screen symptom "title shows 1, no artist, 0:00/0:00" is
+// produced by BOTH a truncated response and a parser that cannot read a
+// complete one. Guessing between them is what produced a chain of speculative
+// fixes that each looked reasonable and none was confirmed on hardware.
+//
+// So the firmware now prints, for the first SOAP_CAPTURE_COUNT polls after boot,
+// the evidence needed to tell the two apart:
+//   - which of the eight GetPositionInfo elements actually arrived,
+//   - the HEAD and the TAIL of the body (a truncated body stops mid-element;
+//     the tail makes that unmistakable),
+//   - the length of the DIDL blob and whether dc:title / dc:creator /
+//     upnp:albumArtURI are inside it.
+//
+// Zero-length DIDL means transport. Non-empty DIDL with a blank title means
+// parser. Nothing else needs to be guessed.
+//
+// SERIAL_CONSOLE adds a command interface on the same UART, so a single build
+// can answer many questions instead of one build per hypothesis.
+#define SERIAL_CONSOLE     1
+#define SOAP_CAPTURE_COUNT 3
+
+// ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
@@ -203,6 +274,26 @@ bool     isPlaying             = false;
 String cachedArtUrl;
 bool   artNeedsRender = true;
 
+// Artwork revision guard.
+//
+// Decoding is by far the slowest thing the firmware does (a progressive JPEG takes
+// hundreds of milliseconds), and it runs on the main loop alongside the 1 s Sonos
+// poll, button handling and the idle timer. Re-decoding when nothing has changed
+// therefore risks starving all of them.
+//
+// artRevision is bumped only when the cached file actually changes; artDrawnRevision
+// records which revision is currently on screen. renderArtwork() skips the decode
+// when they match, so artNeedsRender can be set freely (toast, screen wake) without
+// triggering a redundant decode.
+uint32_t artRevision       = 0;
+uint32_t artDrawnRevision  = 0xFFFFFFFF;  // forces the first render
+
+// Pending artwork fetch. A track change only sets currentArtUri, so the download has to
+// be driven from here and retried until it succeeds; otherwise one transient failure left
+// the previous track's artwork on screen with no way to recover.
+bool          artworkPending  = false;
+unsigned long artworkFirstTry = 0;
+
 // Idle state and screen power.
 bool          screenPowered            = true;
 bool          isIdle                   = true;
@@ -218,6 +309,7 @@ unsigned long toastExpireTime = 0;
 unsigned long lastSonosPollTime = 0;
 unsigned long lastSsdpSearchTime = 0;
 unsigned long lastWifiRetryTime  = 0;
+unsigned long lastSpeakerScanTime = 0;
 
 // Set once an artist string has been seen carrying a '/getaa' continuation,
 // so the condition is reported only on the first occurrence.
@@ -247,7 +339,7 @@ void checkSSDPResponses();
 void addSonosDevice(IPAddress ip);
 void pollSonos();
 void sendSonosAction(const char *action, const char *instanceArgs);
-void downloadArtwork();
+bool downloadArtwork();
 void renderArtwork();
 bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *data);
 
@@ -325,6 +417,106 @@ void logSoapField(const char *label, const String &value) {
     Serial.printf("%02X ", (unsigned char)value.charAt(i));
   }
   Serial.println();
+}
+
+// ---------------------------------------------------------------------------
+// SOAP body capture (diagnostics)
+// ---------------------------------------------------------------------------
+
+// Reports whether an element is present in a body, matched on local name so a
+// namespace prefix is irrelevant.
+//
+// This is the primitive the capture is built on: it answers "did this element
+// arrive at all?", which is the question that separates a transport failure
+// from a parser failure. A parser can only misread data that is present.
+bool hasElement(const String &xml, const char *localName) {
+  String open = String("<") + localName;
+
+  int idx = 0;
+  while ((idx = xml.indexOf(open, idx)) >= 0) {
+    char after = xml.charAt(idx + open.length());
+    // "<Track>" and "<TrackDuration>" both start with "<Track"; require the
+    // next character to end the tag name so one element cannot mask another.
+    if (after == '>' || after == '/' || after == ' ') return true;
+    idx += open.length();
+  }
+
+  return false;
+}
+
+// Prints a snippet of XML on ONE log line, escaping anything unprintable.
+//
+// A raw dump that contains newlines, carriage returns or UTF-8 continuation
+// bytes corrupts the serial log: the snippet appears to end early and the rest
+// lands on unrelated lines. Escaping keeps each capture on a single greppable
+// line, so "how far did the body get" is answerable without counting bytes.
+void logXmlSnippet(const char *label, const String &body, int from, int len) {
+  if (from < 0) from = 0;
+  if (from > (int)body.length()) from = body.length();
+
+  int end = from + len;
+  if (end > (int)body.length()) end = body.length();
+
+  Serial.printf("[Sonos] %s [%d..%d of %d]: \"", label, from, end,
+                (int)body.length());
+
+  for (int i = from; i < end; i++) {
+    unsigned char c = (unsigned char)body.charAt(i);
+
+    if (c == '\r')      Serial.print("\\r");
+    else if (c == '\n') Serial.print("\\n");
+    else if (c == '\t') Serial.print("\\t");
+    else if (c < 32 || c > 126) Serial.printf("\\x%02X", c);
+    else Serial.write((char)c);
+  }
+
+  Serial.println("\"");
+}
+
+// Logs which GetPositionInfo elements actually arrived, and the head and tail
+// of the body.
+//
+// The tail is the important half. A body truncated mid-response stops at an
+// arbitrary offset, and the last tag seen is the whole diagnosis: cut after
+// <Track> and the title is a queue number with everything after it missing;
+// ending in "</s:Envelope>" means the body WAS complete and the fault is
+// downstream in the parser.
+void logPositionInfoBody(const String &body) {
+  static const char *kElements[] = {
+      "Track", "TrackDuration", "TrackMetaData", "CurrentTrackMetaData",
+      "TrackURI", "RelTime", "AbsTime", "RelCount"};
+
+  Serial.printf("[Sonos] Elements present:");
+  for (unsigned int i = 0; i < sizeof(kElements) / sizeof(kElements[0]); i++) {
+    Serial.printf(" %s=%s", kElements[i], hasElement(body, kElements[i]) ? "Y" : "N");
+  }
+  Serial.println();
+
+  bool closed = (body.indexOf("</s:Envelope>") >= 0);
+  Serial.printf("[Sonos] Envelope closed: %s  (body=%d bytes)\n",
+                closed ? "YES" : "NO", (int)body.length());
+
+  logXmlSnippet("HEAD", body, 0, 260);
+  logXmlSnippet("TAIL", body, body.length() - 260, 260);
+}
+
+// Logs the state of the DIDL blob and the three elements taken from it.
+//
+// blob=0 settles the transport-vs-parser question outright:
+//   blob=0                    -> the metadata never arrived; parsing is irrelevant
+//   blob>0, title missing     -> the DIDL arrived but dc:title could not be read
+//   blob>0, title present     -> parsing worked; the screen is at fault
+void logDidlState(const String &metaData) {
+  Serial.printf("[Sonos] DIDL blob: %d bytes, dc:title=%s dc:creator=%s "
+                "upnp:albumArtURI=%s\n",
+                (int)metaData.length(),
+                hasElement(metaData, "dc:title")   ? "Y" : "N",
+                hasElement(metaData, "dc:creator") ? "Y" : "N",
+                hasElement(metaData, "upnp:albumArtURI") ? "Y" : "N");
+
+  if (metaData.length() > 0) {
+    logXmlSnippet("DIDL", metaData, 0, 300);
+  }
 }
 
 // Normalises a display string for the bundled bitmap fonts.
@@ -913,7 +1105,16 @@ static int readLineRaw(WiFiClient *stream, char *buf, int maxLen) {
 // Sonos does not always send a usable Content-Length, and HTTPClient's
 // getString() returns "" when that header is 0, so the body is pulled from
 // the socket here instead.
-static String readHttpBody(HTTPClient &http) {
+//
+// `complete` (optional) reports whether the whole body was actually read. A
+// connection that drops part-way through yields a SHORT body with no error
+// from readBytes(), which used to be returned as if it were complete. For
+// GetPositionInfo that matters a lot: <Track> is the first element, so a
+// truncated response still yields a track number while the title, artist,
+// duration and artwork URI silently disappear. Callers use this to retry.
+static String readHttpBody(HTTPClient &http, bool *complete = nullptr) {
+  if (complete != nullptr) *complete = false;
+
   WiFiClient *stream = http.getStreamPtr();
   if (stream == nullptr) return String();
 
@@ -921,13 +1122,22 @@ static String readHttpBody(HTTPClient &http) {
   body.reserve(2048);
   uint8_t buf[256];
 
+  // Bounded wait, so a socket that never delivers and never disconnects cannot
+  // spin here forever and stall the whole main loop.
+  const uint32_t deadline = millis() + HTTP_BODY_READ_TIMEOUT_MS;
+
   if (http.getSize() > 0) {
     // Known length: read exactly that many bytes.
     int remaining = http.getSize();
 
-    while (remaining > 0 && http.connected()) {
+    while (remaining > 0) {
       int available = stream->available();
       if (available <= 0) {
+        if (!http.connected()) break;          // peer went away: short read
+        if ((int32_t)(millis() - deadline) > 0) {
+          Serial.println("[HTTP] Timed out waiting for response body.");
+          break;
+        }
         delay(1);
         continue;
       }
@@ -937,8 +1147,18 @@ static String readHttpBody(HTTPClient &http) {
       int got = stream->readBytes(buf, want);
       if (got <= 0) break;
 
-      body += String((const char *)buf, got);
+      // concat() appends in place; building a temporary String per chunk both
+      // costs an allocation each iteration and loses data if it fails.
+      body.concat((const char *)buf, got);
       remaining -= got;
+    }
+
+    bool full = (remaining == 0);
+    if (complete != nullptr) *complete = full;
+
+    if (!full) {
+      Serial.printf("[HTTP] Truncated body: got %u of %d bytes.\n",
+                    (unsigned)body.length(), (int)http.getSize());
     }
     return body;
   }
@@ -995,12 +1215,13 @@ static String readHttpBody(HTTPClient &http) {
     int got = stream->readBytes(buf, want);
     if (got <= 0) break;
 
-    body += String((const char *)buf, got);
+    body.concat((const char *)buf, got);
     chunkRemaining -= got;
 
     if (chunkRemaining == 0) inChunk = false;
   }
 
+  if (complete != nullptr) *complete = true;
   return body;
 }
 
@@ -1075,46 +1296,79 @@ String buildEnvelope(const char *action, const char *instanceArgs) {
   return envelope;
 }
 
-// Issues a SOAP action against the active speaker and returns the body.
-String sonosSoap(const char *action, const char *instanceArgs) {
-  if (activeSonosIP[0] == 0) return String();
+// Issues a SOAP action against a specific speaker and returns the body.
+// Used to probe candidate speakers as well as the active one.
+//
+// A truncated response is retried rather than returned. This matters for
+// GetPositionInfo specifically: <Track> is the first element in the body, so a
+// short read still yields a track number while TrackDuration, CurrentTrackMetaData
+// and RelTime are all cut off. The result was a screen showing the queue number
+// as the title, no artist, 0:00 / 0:00, and no artwork - which looks exactly
+// like a parsing bug but is a transport one.
+String sonosSoapTo(const IPAddress &ip, const char *action,
+                  const char *instanceArgs, bool verbose = true) {
+  if (ip[0] == 0) return String();
 
-  String url = "http://" + activeSonosIP.toString() + ":" + String(SONOS_PORT) +
+  String url = "http://" + ip.toString() + ":" + String(SONOS_PORT) +
                SONOS_CONTROL_PATH;
-
-  WiFiClient client;
-  HTTPClient http;
-  http.setTimeout(HTTP_TIMEOUT_MS);
-  http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
-  http.setUserAgent("SonosDisplay/" APP_VERSION);
-
-  if (!http.begin(client, url)) {
-    Serial.println("[Debug] SOAP begin() failed.");
-    return String();
-  }
 
   String soapAction = "\"urn:schemas-upnp-org:service:AVTransport:1#";
   soapAction += action;
   soapAction += "\"";
 
-  http.addHeader("Content-Type", "text/xml; charset=\"utf-8\"");
-  http.addHeader("SOAPACTION", soapAction);
+  for (int attempt = 1; attempt <= 2; attempt++) {
+    WiFiClient client;
+    HTTPClient http;
+    http.setTimeout(HTTP_TIMEOUT_MS);
+    http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
+    http.setUserAgent("SonosDisplay/" APP_VERSION);
 
-  int status = http.POST(buildEnvelope(action, instanceArgs));
-  String body;
+    if (!http.begin(client, url)) {
+      if (verbose) Serial.println("[Debug] SOAP begin() failed.");
+      return String();
+    }
 
-  if (status == 200) {
-    int contentLength = http.getSize();
-    body = readHttpBody(http);
+    http.addHeader("Content-Type", "text/xml; charset=\"utf-8\"");
+    http.addHeader("SOAPACTION", soapAction);
 
-    Serial.printf("[Debug] %s -> HTTP %d, Content-Length=%d, received=%d bytes\n",
-                  action, status, contentLength, body.length());
-  } else {
-    Serial.printf("[Debug] %s failed: HTTP %d\n", action, status);
+    int     status  = http.POST(buildEnvelope(action, instanceArgs));
+    String  body;
+    bool    complete = false;
+
+    if (status == 200) {
+      int contentLength = http.getSize();
+      body = readHttpBody(http, &complete);
+
+      if (verbose) {
+        Serial.printf("[Debug] %s -> HTTP %d, Content-Length=%d, received=%d bytes%s\n",
+                      action, status, contentLength, body.length(),
+                      complete ? "" : " (TRUNCATED)");
+      }
+
+      http.end();
+
+      if (complete || body.length() == 0) return body;
+
+      // Short read: close the socket and try once more on a fresh connection.
+      if (verbose) {
+        Serial.printf("[Debug] %s body truncated, retrying (%d/2).\n",
+                      action, attempt);
+      }
+      delay(50);
+      continue;
+    }
+
+    if (verbose) Serial.printf("[Debug] %s failed: HTTP %d\n", action, status);
+    http.end();
+    return body;
   }
 
-  http.end();
-  return body;
+  return String();
+}
+
+// Issues a SOAP action against the active speaker and returns the body.
+String sonosSoap(const char *action, const char *instanceArgs) {
+  return sonosSoapTo(activeSonosIP, action, instanceArgs, true);
 }
 
 // Sends a playback control action (Play, Pause, Next, ...).
@@ -1157,6 +1411,17 @@ int    artLastStatus  = 0;      // HTTP status, 0 = not attempted
 String artLastRoute;            // "DIRECT", "PROXY" or "UNRESOLVED"
 String artLastHost;             // host the request went to
 String artLastNote;             // short reason text
+
+// Short reason the last stage of the artwork pipeline failed, or "" if none did.
+//
+// Separate from artLastNote because HTTP 200 only means the speaker answered; it
+// says nothing about whether a complete JPEG arrived or whether it decoded. The
+// panel used to prefer the status code, so a missing-EOI body and a decode
+// failure BOTH displayed as "200" and were indistinguishable in a photograph -
+// which is how one attempt got logged as "PROXY 200" with no stated cause.
+// The failure reason now takes priority over the status code on screen.
+String artDownloadError;        // download stage: "no EOI", "partial", ...
+String artRenderError;          // render stage:  "no header", "decode fail", ...
 
 // A write-only Stream that forwards everything into an open LittleFS file,
 // capped at a maximum size.
@@ -1325,7 +1590,8 @@ static bool fetchArtworkFrom(const String &startUrl, File &artFile,
     // rather than caching a broken file.
     if (wroteAny && !sink.endedWithEoi()) {
       Serial.println("[Art]   Body is not a complete JPEG (no EOI marker).");
-      artLastNote = "truncated";
+      artLastNote    = "truncated";
+      artDownloadError = "no EOI";
       http.end();
       break;
     }
@@ -1343,8 +1609,16 @@ static bool fetchArtworkFrom(const String &startUrl, File &artFile,
   return success;
 }
 
-void downloadArtwork() {
-  if (currentArtUri.length() == 0) return;
+// Attempts to download and cache the artwork for currentArtUri.
+//
+// Returns true when the cached file on disk holds the current track's artwork.
+// A false return is retryable: the caller must keep trying, because the only other
+// trigger for a download is the artwork URI changing. Previously a single failed
+// attempt (a transient timeout, or the speaker not yet ready after a track change)
+// left the OLD cached image in place with no way to recover, so the display showed
+// the previous track's cover indefinitely.
+bool downloadArtwork() {
+  if (currentArtUri.length() == 0) return false;
 
   String candidates[2];
   int    count = artworkUrlCandidates(currentArtUri, candidates, 2);
@@ -1355,16 +1629,22 @@ void downloadArtwork() {
     artLastHost   = "?";
     artLastNote   = "no speaker IP";
     Serial.println("[Art] Could not resolve artwork URL.");
-    return;
+    return false;
   }
 
   if (candidates[0] == cachedArtUrl) {
-    artNeedsRender = true;  // already cached on disk
-    return;
+    // Already cached on disk. Only ask for a render if that cached file has not been
+    // decoded yet (or the screen was cleared since); otherwise this would trigger a
+    // pointless slow decode on every poll.
+    if (artDrawnRevision != artRevision) artNeedsRender = true;
+    return true;
   }
 
   artLastStatus = 0;
   artLastNote   = "";
+  // Cleared at the start of every real attempt so a stale reason from a previous
+  // track cannot be shown next to this track's status code.
+  artDownloadError = "";
 
   Serial.println("[Art] ====================================");
   Serial.printf("[Art] Candidate routes: %d\n", count);
@@ -1372,7 +1652,7 @@ void downloadArtwork() {
   File artFile = LittleFS.open(ART_FILE_PATH, FILE_WRITE);
   if (!artFile) {
     Serial.println("[Art] Failed to open /art.jpg for writing.");
-    return;
+    return false;
   }
 
   bool   success  = false;
@@ -1405,8 +1685,9 @@ void downloadArtwork() {
 
     received = 0;
     if (fetchArtworkFrom(url, artFile, received)) {
-      success = true;
-      usedUrl = url;
+      success  = true;
+      wroteAny = (received > 0);
+      usedUrl  = url;
       break;
     }
 
@@ -1419,22 +1700,25 @@ void downloadArtwork() {
   if (success) {
     cachedArtUrl   = usedUrl;
     artNeedsRender = true;
+    artRevision++;  // cached file changed, so a re-decode is genuinely needed
     artLastNote    = String(received) + " bytes";
     Serial.printf("[Art] Cached via %s (%u bytes)\n", artLastRoute.c_str(),
                   (unsigned)received);
   } else {
     // Partial or empty download: discard so a truncated JPEG is never drawn.
+    // The cachedArtUrl is deliberately NOT updated, so the next retry will fetch again.
     LittleFS.remove(ART_FILE_PATH);
     if (wroteAny) {
       artLastNote = "partial";
       Serial.println("[Art] Partial download, cached file removed.");
     } else {
       if (artLastNote.length() == 0) artLastNote = "no data";
-      Serial.printf("[Art] All %d route(s) failed.\n", count);
+      Serial.printf("[Art] All %d route(s) failed, will retry.\n", count);
     }
   }
 
   Serial.println("[Art] ====================================");
+  return success;
 }
 
 // TJpg_Decoder callback: pushes each decoded block into the artwork area.
@@ -1459,6 +1743,341 @@ bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *data) {
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// JPEG decoding
+//
+// Two decoders, selected by the frame type reported by jpegInfo():
+//
+//   baseline    -> esp_jpg_decode()  (ESP-IDF ROM TJpgDec). Fast and streams the
+//                  cached file through a random-access reader, so peak RAM is the
+//                  decoder's own working set rather than the size of the image.
+//   progressive -> JPEGDEC. Required because Sonos serves progressive artwork for
+//                  local library tracks and TJpgDec rejects SOF2 outright with
+//                  JDR_FMT3 ("may be a progressive JPEG image"). JPEGDEC is also
+//                  fed the file through open(File&, ...), so the image stays on
+//                  LittleFS instead of being pulled into RAM.
+//
+// Both paths converge on tft_output(), which clips to the artwork region, so
+// neither decoder can overwrite the text below.
+// ---------------------------------------------------------------------------
+
+// Offset applied to progressive renders, which are decoded from the image's own
+// top-left corner rather than at a caller-supplied position.
+static int32_t artDestX = 0;
+static int32_t artDestY = 0;
+
+// esp_jpg_decode's reader is random access: it is handed an offset and a length
+// and served synchronously, so the JPEG never has to be resident in RAM as one
+// block. That matters here, because this ESP32 has ~320 KB of internal DRAM, no
+// PSRAM, and only about 70 KB of BSS headroom left -- far less than the 131 KB
+// a local-library cover image occupies. Pointing the reader at the cached file
+// keeps peak RAM to the decoder's own working set.
+struct JpgSource {
+  File   *file;   // cached JPEG, positioned on demand
+  size_t  size;   // total bytes available
+};
+
+static size_t jpg_read_cb(void *arg, size_t index, uint8_t *buf, size_t len) {
+  JpgSource *src = static_cast<JpgSource *>(arg);
+  if (!src || !src->file || !buf) return 0;
+
+  if (index >= src->size) return 0;  // nothing left
+  size_t avail = src->size - index;
+  if (len > avail) len = avail;
+  if (len == 0) return 0;
+
+  if (!src->file->seek(index)) return 0;
+
+  // Loop, because the filesystem may satisfy a large request with a short read.
+  // Returning a short count here is what produced the old "Read Fail at
+  // 6/131716"; the decoder treats it as a hard error.
+  size_t done = 0;
+  while (done < len) {
+    int got = src->file->read(buf + done, len - done);
+    if (got <= 0) break;  // error or EOF
+    done += (size_t)got;
+  }
+  return done;
+}
+
+// Writer callback: receives one decoded block as RGB565 bytes.
+//
+// esp_jpg_decode emits blocks at image coordinates starting at 0,0, so the
+// centred destination offset is added here before the shared clipping/drawing
+// helper is used.
+static bool jpg_write_cb(void *arg, uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                        uint8_t *data) {
+  (void)arg;
+  return tft_output(static_cast<int16_t>(x + artDestX), static_cast<int16_t>(y + artDestY),
+                    w, h, reinterpret_cast<uint16_t *>(data));
+}
+
+// Maps the 1/1..1/8 reduction factor onto esp_jpg's scale enum.
+static jpg_scale_t scaleIdxEsp(uint8_t factor) {
+  switch (factor) {
+    case 2:  return JPG_SCALE_2X;
+    case 4:  return JPG_SCALE_4X;
+    case 8:  return JPG_SCALE_8X;
+    default: return JPG_SCALE_NONE;
+  }
+}
+
+// Reads the JPEG's start-of-frame marker and reports whether it is progressive,
+// along with the frame width and height. Returns false when no SOF is found.
+//
+// Markers are walked strictly in order: the two bytes after a marker are its
+// segment length, so skipping that many bytes lands exactly on the next marker
+// and a marker split across two reads can never be misread.
+static bool jpegInfo(File &f, bool &progressive, uint16_t &w, uint16_t &h) {
+  progressive = false;
+  w = 0;
+  h = 0;
+
+  // Expect the start-of-image marker.
+  uint8_t soi[2];
+  if (f.read(soi, 2) != 2 || soi[0] != 0xFF || soi[1] != 0xD8) return false;
+
+  while (f.position() < 64 * 1024) {
+    // Find the next 0xFF that is not a fill byte.
+    uint8_t b;
+    do {
+      if (f.read(&b, 1) != 1) return false;
+    } while (b != 0xFF);
+
+    uint8_t marker;
+    do {
+      if (f.read(&marker, 1) != 1) return false;
+    } while (marker == 0xFF);
+
+    // Standalone markers carry no payload.
+    if (marker == 0xD8 || marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7)) {
+      continue;
+    }
+    if (marker == 0xD9) return false;  // end of image before any frame
+
+    uint8_t lenBuf[2];
+    if (f.read(lenBuf, 2) != 2) return false;
+    uint16_t segLen = (uint16_t)((lenBuf[0] << 8) | lenBuf[1]);
+    if (segLen < 2) return false;
+
+    // SOF0 (baseline) through SOF15, excluding the marker-less ones.
+    bool isSof = (marker >= 0xC0 && marker <= 0xCF) && marker != 0xC4 &&
+                 marker != 0xC8 && marker != 0xCC;
+    if (isSof) {
+      if (segLen < 8) return false;
+
+      uint8_t frame[7];  // precision, height(2), width(2), components, ...
+      if (f.read(frame, sizeof(frame)) != sizeof(frame)) return false;
+
+      progressive = (marker == 0xC2);
+      h            = (uint16_t)((frame[1] << 8) | frame[2]);
+      w            = (uint16_t)((frame[3] << 8) | frame[4]);
+      return (w > 0 && h > 0);
+    }
+
+    // Skip the rest of this segment's payload.
+    if (!f.seek(f.position() + (segLen - 2))) return false;
+  }
+
+  return false;
+}
+
+// Decodes the cached JPEG with esp_jpg_decode (BASELINE only) and draws it.
+// Returns the esp_err_t from esp_jpg_decode.
+//
+// This cannot handle a progressive frame: jd_prepare() returns JDR_FMT3, which
+// esp_jpg_decode maps to ESP_FAIL. renderArtwork() routes progressive files to
+// renderCachedJpegProgressive() instead.
+static esp_err_t renderCachedJpeg(const char *path, jpg_scale_t scale) {
+  File f = LittleFS.open(path, "r");
+  if (!f) return ESP_FAIL;
+
+  size_t size = (size_t)f.size();
+  if (size == 0) {
+    f.close();
+    return ESP_FAIL;
+  }
+
+  // The file stays open for the whole decode and is served to the decoder
+  // through the random-access reader, so peak RAM is the decoder's own working
+  // set rather than the size of the image.
+  JpgSource src   = {&f, size};
+  esp_err_t err   = esp_jpg_decode(size, scale, jpg_read_cb, jpg_write_cb, &src);
+
+  f.close();
+  return err;
+}
+
+// JPEGDEC file callbacks over a LittleFS File.
+//
+// The library's convenience overloads are deliberately not used:
+//   - open(File&, cb) sits behind #ifdef FS_H. On an ESP_PLATFORM build JPEGDEC.h
+//     takes its first include branch, which does not include <FS.h>, so FS_H is never
+//     defined while JPEGDEC.cpp compiles. The overload is therefore omitted from
+//     libJPEGDEC.a and the link fails with an undefined reference. That block also
+//     contains a latent bug (FileClose dereferences a void* as handle->fHandle), so
+//     it evidently has not been compiled on ESP_PLATFORM.
+//   - openRAM/openFLASH need the whole JPEG resident in RAM. A local-library cover is
+//     ~138 KB, which does not fit alongside WiFi and the display buffer on a board
+//     with ~320 KB DRAM and no PSRAM.
+//
+// The raw-handle overload is compiled unconditionally. These callbacks mirror the
+// library's own internal file adapters, so the image is streamed from LittleFS and
+// never resident in RAM.
+static int32_t jpegdecRead(JPEGFILE *handle, uint8_t *buffer, int32_t length) {
+  if (handle == nullptr || handle->fHandle == nullptr || buffer == nullptr) return 0;
+  File *f = static_cast<File *>(handle->fHandle);
+  return static_cast<int32_t>(f->read(buffer, static_cast<size_t>(length)));
+}
+
+static int32_t jpegdecSeek(JPEGFILE *handle, int32_t position) {
+  if (handle == nullptr || handle->fHandle == nullptr) return 0;
+  File *f = static_cast<File *>(handle->fHandle);
+  return static_cast<int32_t>(f->seek(static_cast<uint32_t>(position)));
+}
+
+static void jpegdecClose(void *handle) {
+  if (handle == nullptr) return;
+  static_cast<File *>(handle)->close();
+}
+
+// JPEGDEC draw callback.
+//
+// PIXEL BYTE ORDER: JPEGDEC must be set to RGB565_BIG_ENDIAN, not its
+// RGB565_LITTLE_ENDIAN default. TFT_eSPI's pushImage(uint16_t*) streams the colour
+// bytes most-significant-first (setSwapBytes() is false by default), so the decoder
+// has to pre-swap each 16-bit value for the display to receive it correctly. Every
+// JPEGDEC example that drives an SPI LCD does the same, with the comment "the LCD
+// wants the 16-bit pixels in big-endian order". Leaving it little-endian swaps the
+// red and blue byte of every pixel, which washes the artwork out and turns fine
+// detail magenta/cyan.
+//
+// iWidthUsed vs iWidth: at the right-hand edge of the image a block can be narrower
+// than the row pitch (iWidth). Only the first iWidthUsed pixels of each row are valid;
+// the remainder is stale. Those rows are therefore pushed one at a time, because
+// pushImage() assumes a contiguous w*h block and would otherwise read past the valid
+// data and shear the block.
+//
+// artDestX/artDestY are zero on this path: JPEGDEC is given an absolute destination in
+// decode(), so its blocks already carry final screen coordinates and no offset is
+// added here. The shared globals are kept only so tft_output() can be reused verbatim
+// for clipping — it is the same helper the baseline path uses.
+static int jpegdecDrawMCUs(JPEGDRAW *pDraw) {
+  if (pDraw == nullptr) return 0;
+
+  int16_t  x    = static_cast<int16_t>(pDraw->x + artDestX);
+  int16_t  y    = static_cast<int16_t>(pDraw->y + artDestY);
+  uint16_t w    = static_cast<uint16_t>(pDraw->iWidth);
+  uint16_t h    = static_cast<uint16_t>(pDraw->iHeight);
+  uint16_t used = static_cast<uint16_t>(pDraw->iWidthUsed);
+
+  if (used > 0 && used < w) {
+    // Edge block: rows are still `w` apart, so push each valid row separately.
+    for (uint16_t row = 0; row < h; row++) {
+      tft_output(x, static_cast<int16_t>(y + row), used, 1,
+                 pDraw->pPixels + static_cast<size_t>(row) * w);
+    }
+  } else {
+    tft_output(x, y, w, h, pDraw->pPixels);
+  }
+
+  // Returning 1 tells JPEGDEC to keep going; 0 would abort the decode.
+  return 1;
+}
+
+// Maps the 1/1..1/8 reduction factor onto JPEGDEC's scale flags.
+static int scaleFlagsJpegdec(uint8_t factor) {
+  switch (factor) {
+    case 2:  return JPEG_SCALE_HALF;
+    case 4:  return JPEG_SCALE_QUARTER;
+    case 8:  return JPEG_SCALE_EIGHTH;
+    default: return 0;
+  }
+}
+
+// Decodes the cached PROGRESSIVE JPEG with JPEGDEC and draws it. Returns true on
+// success.
+//
+// JPEGDEC is instantiated on the heap rather than as a static global because its
+// internal state is ~18 KB. Allocating it statically would permanently consume that
+// much DRAM on a board with ~320 KB and no PSRAM; heap allocation means it is only
+// resident while an image is decoding.
+//
+// The raw-handle overload is used rather than open(File&, ...) because the latter is
+// excluded from the compiled library on ESP_PLATFORM builds (see the callback notes
+// above). Either way the file is read through the File, so the ~138 KB image stays in
+// LittleFS instead of being pulled into RAM.
+static bool renderCachedJpegProgressive(const char *path, uint8_t scaleFactor) {
+  File f = LittleFS.open(path, "r");
+  if (!f) return false;
+
+  if (f.size() == 0) {
+    f.close();
+    return false;
+  }
+
+  JPEGDEC *jpeg = new (std::nothrow) JPEGDEC();
+  if (jpeg == nullptr) {
+    Serial.println("[Art] Out of memory allocating JPEGDEC.");
+    artRenderError = "no RAM";
+    f.close();
+    return false;
+  }
+
+  Serial.printf("[Art] Free heap before decode: %u bytes\n",
+                (unsigned)ESP.getFreeHeap());
+
+  bool ok = false;
+
+  if (jpeg->open(&f, static_cast<int>(f.size()),
+                 jpegdecClose, jpegdecRead, jpegdecSeek, jpegdecDrawMCUs)) {
+    // Log the decoder's own view of the file so a mismatch with jpegInfo() is
+    // visible, and so the frame type actually parsed is on record.
+    Serial.printf("[Art] JPEGDEC opened: %d x %d, mode=%s\n",
+                  jpeg->getWidth(), jpeg->getHeight(),
+                  jpeg->getJPEGType() == JPEG_MODE_PROGRESSIVE ? "progressive"
+                                                               : "baseline");
+
+    // Big endian, NOT the library default. TFT_eSPI pushes the colour bytes
+    // most-significant-first, so leaving this little-endian swaps the red and blue
+    // byte of every pixel. See the note on jpegdecDrawMCUs().
+    jpeg->setPixelType(RGB565_BIG_ENDIAN);
+
+    // decode() takes the destination position in output (post-scale) pixels, so the
+    // centred offset is computed here and the callback stays a straight pass-through.
+    uint16_t outW = static_cast<uint16_t>(jpeg->getWidth()  / scaleFactor);
+    uint16_t outH = static_cast<uint16_t>(jpeg->getHeight() / scaleFactor);
+
+    // JPEGDEC positions blocks itself, so no offset is applied in the callback.
+    artDestX = 0;
+    artDestY = 0;
+
+    uint16_t destX = static_cast<uint16_t>(ART_AREA_X + (ART_AREA_W - outW) / 2);
+    uint16_t destY = static_cast<uint16_t>(ART_AREA_Y + (ART_AREA_H - outH) / 2);
+
+    ok = jpeg->decode(destX, destY, scaleFlagsJpegdec(scaleFactor)) != 0;
+
+    if (!ok) {
+      Serial.printf("[Art] JPEGDEC decode failed, error=%d\n", jpeg->getLastError());
+      artRenderError = "prog decode fail";
+    }
+
+    // jpeg->close() closes the File it was opened with, so f must not be closed
+    // again on this path.
+    jpeg->close();
+  } else {
+    Serial.println("[Art] JPEGDEC could not parse the JPEG header.");
+    artRenderError = "no header";
+    f.close();
+  }
+
+  Serial.printf("[Art] Free heap after decode: %u bytes\n",
+                (unsigned)ESP.getFreeHeap());
+
+  delete jpeg;
+  return ok;
+}
+
 // Decodes and draws the cached artwork, scaled to fit the artwork area.
 void renderArtwork() {
   if (!artNeedsRender) return;
@@ -1466,26 +2085,53 @@ void renderArtwork() {
 
   if (!screenPowered) return;
 
+  // Skip the decode when the artwork already on screen is current. Drawing a toast or
+  // waking the display sets artNeedsRender too, but neither changes the cached file, and
+  // re-decoding a progressive JPEG is slow enough to stall the main loop.
+  if (artDrawnRevision == artRevision) return;
+  artDrawnRevision = artRevision;
+
   tft.fillRect(ART_AREA_X, ART_AREA_Y, ART_AREA_W, ART_AREA_H, TFT_BLACK);
+
+  artRenderError = "";  // cleared: this render is about to decide the outcome
 
   if (!LittleFS.exists(ART_FILE_PATH)) {
     Serial.println("[Art] No cached artwork, drawing placeholder.");
+    artRenderError = "not cached";
     drawArtworkPlaceholder();
     return;
   }
 
+  // Inspect the file's own header for the frame size. Only the marker segment is
+  // read, so this is cheap and works for progressive and baseline alike.
+  File     infoFile = LittleFS.open(ART_FILE_PATH, "r");
+  bool     progressive = false;
   uint16_t w = 0, h = 0;
-  JRESULT  sizeResult = TJpgDec.getFsJpgSize(&w, &h, ART_FILE_PATH, LittleFS);
-  if (sizeResult != JDR_OK) {
-    Serial.printf("[Art] getJpgSize failed: %d\n", (int)sizeResult);
+  bool     haveInfo = false;
+
+  if (infoFile) {
+    haveInfo = jpegInfo(infoFile, progressive, w, h);
+    infoFile.close();
+  }
+
+  if (!haveInfo) {
+    Serial.println("[Art] Could not read JPEG frame header.");
+    artRenderError = "no header";
     drawArtworkPlaceholder();
     return;
   }
 
-  Serial.printf("[Art] JPEG dimensions: %u x %u\n", w, h);
+  Serial.printf("[Art] JPEG dimensions: %u x %u (%s)\n", w, h,
+                progressive ? "progressive" : "baseline");
 
   // Pick the smallest reduction factor that fits the artwork area, keeping
-  // the image as large as possible.
+  // the image as large as possible. esp_jpg_decode only offers 1/1..1/8.
+  //
+  // Note for progressive images: JPEGDEC decodes only the first (DC) scan and forces
+  // its own 1/8 scaling, so the picture it produces is a low-detail thumbnail rather
+  // than a full decode, and the effective size may differ from outW/outH below. It is
+  // drawn regardless so something sensible is shown; see ARTWORK-ATTEMPTS.md (attempt
+  // E) for why this is not a real fix.
   uint8_t  scaleFactor = 1;
   uint16_t outW = w, outH = h;
   while ((outW > ART_AREA_W || outH > ART_AREA_H) && scaleFactor < 8) {
@@ -1499,21 +2145,41 @@ void renderArtwork() {
 
   Serial.printf("[Art] Rendering at 1/%u -> %u x %u\n", scaleFactor, outW, outH);
 
-  TJpgDec.setJpgScale(scaleFactor);
-  TJpgDec.setCallback(tft_output);
+  // Both decoders consume blocks through tft_output(), which clips to the artwork
+  // region. The centred destination offset differs per decoder: esp_jpg_decode emits
+  // at image coordinates from 0,0 so its writer callback adds the offset, whereas
+  // JPEGDEC takes the destination directly in decode(). artDestX/Y are zero for the
+  // JPEGDEC path.
+  //
+  // Which decoder runs is decided by the frame type jpegInfo() found, not by trying
+  // one and falling back: esp_jpg_decode is baseline-only and JPEGDEC handles both,
+  // so progressive images must not be sent to esp_jpg_decode at all.
+  bool rendered;
 
-  int32_t destX = ART_AREA_X + (ART_AREA_W - outW) / 2;
-  int32_t destY = ART_AREA_Y + (ART_AREA_H - outH) / 2;
-
-  JRESULT result = TJpgDec.drawFsJpg(destX, destY, ART_FILE_PATH, LittleFS);
-  if (result != JDR_OK) {
-    Serial.printf("[Art] drawFsJpg failed: %d\n", (int)result);
-    // The file decoded as JPEG headers but could not be rendered; show the
-    // URL so the source of the bad image is visible on screen.
-    drawArtworkPlaceholder();
+  if (progressive) {
+    Serial.printf("[Art] Progressive frame -> JPEGDEC at 1/%u\n", scaleFactor);
+    rendered = renderCachedJpegProgressive(ART_FILE_PATH, scaleFactor);
   } else {
-    Serial.println("[Art] Render complete.");
+    artDestX = ART_AREA_X + (ART_AREA_W - outW) / 2;
+    artDestY = ART_AREA_Y + (ART_AREA_H - outH) / 2;
+
+    Serial.printf("[Art] Baseline frame -> esp_jpg_decode at 1/%u\n", scaleFactor);
+    rendered = (renderCachedJpeg(ART_FILE_PATH, scaleIdxEsp(scaleFactor)) == ESP_OK);
   }
+
+  if (!rendered) {
+    Serial.println("[Art] Decode failed, drawing placeholder.");
+    // Distinguish the three ways a decode can fail on screen: the decoder could
+    // not be allocated, could not parse the header, or parsed it and then failed.
+    // They have completely different fixes, so they must not share one label.
+    if (artRenderError.length() == 0) {
+      artRenderError = progressive ? "prog decode fail" : "decode fail";
+    }
+    drawArtworkPlaceholder();
+    return;
+  }
+
+  Serial.println("[Art] Render complete.");
 }
 
 // ---------------------------------------------------------------------------
@@ -1541,6 +2207,42 @@ void pollSonos() {
       xmlUnescape(extractXmlValue(transportBody, "CurrentTransportState"));
   if (state.length() > 0) currentTransportState = state;
 
+  // ---- Follow whichever speaker is actually playing ----------------------
+  //
+  // A house can have several speakers, and only one of them is usually
+  // playing. Whichever answered SSDP first gets adopted, which can easily be an
+  // idle speaker in another room: it answers with a short response carrying no
+  // track metadata, so the display shows nothing even though music is playing
+  // elsewhere. When the active speaker is idle, probe the other known speakers
+  // and switch to one that is playing.
+  if (state == "STOPPED" && sonosDeviceCount > 1) {
+    if (millis() - lastSpeakerScanTime > SPEAKER_SCAN_INTERVAL_MS) {
+      lastSpeakerScanTime = millis();
+
+      for (int i = 0; i < sonosDeviceCount; i++) {
+        if (sonosDevices[i] == activeSonosIP) continue;
+
+        String probe = sonosSoapTo(sonosDevices[i], "GetTransportInfo",
+                                   "<InstanceID>0</InstanceID>", false);
+        if (probe.length() == 0) continue;
+
+        String otherState =
+            xmlUnescape(extractXmlValue(probe, "CurrentTransportState"));
+        if (otherState == "PLAYING" || otherState == "PAUSED_PLAYBACK") {
+          Serial.printf("[Sonos] Switching to playing speaker at %s (%s)\n",
+                        sonosDevices[i].toString().c_str(), otherState.c_str());
+          activeSonosIP = sonosDevices[i];
+          cachedArtUrl  = String();  // force an artwork fetch from the new speaker
+          // Re-arm the pending fetch so the artwork is actually re-downloaded from the
+          // new speaker; downloadArtwork() will otherwise short-circuit on the old cache.
+          artworkPending = currentArtUri.length() > 0;
+          invalidateMetadata();
+          return;  // poll again on the next interval to read its track info
+        }
+      }
+    }
+  }
+
   // ---- GetPositionInfo ---------------------------------------------------
   // Renders the title, artist, elapsed/total times and the artwork.
   //
@@ -1557,16 +2259,26 @@ void pollSonos() {
     return;
   }
 
-  // Dump the raw response once so the exact tag names and ordering can be
-  // confirmed from the serial log when parsing needs investigating.
-  static bool dumpedPositionInfo = false;
-  if (!dumpedPositionInfo) {
-    dumpedPositionInfo = true;
-    Serial.println("========== GetPositionInfo RAW (first 1400 bytes) ==========");
-    Serial.println(positionBody.substring(0, 1400));
-    Serial.println("========== END RAW ==========");
+  // Capture the body for the first few polls after boot. This replaced a
+  // one-shot dump of the first 1400 bytes, which could not distinguish the two
+  // candidate causes: a 1400-byte prefix of a ~1500-byte body looks identical
+  // whether the response ended at 1503 bytes or was cut at 400.
+  //
+  // logPositionInfoBody() prints the element-presence map plus the head AND the
+  // tail, so "how far did the body get" is answerable at a glance. It is capped
+  // at SOAP_CAPTURE_COUNT polls because a full body dump every second is a wall
+  // of text that hides the lines that matter.
+  static int captureCountdown = SOAP_CAPTURE_COUNT;
+  bool capturing = (captureCountdown > 0);
+  if (capturing) captureCountdown--;
+
+  if (capturing) {
+    Serial.printf("[Sonos] ===== GetPositionInfo capture %d/%d =====\n",
+                  SOAP_CAPTURE_COUNT - captureCountdown, SOAP_CAPTURE_COUNT);
+    logPositionInfoBody(positionBody);
   }
 
+  // Metadata first, because it is the authoritative source
   // Title and artist are extracted by the same helper with the same rules, so
   // neither field can behave differently from the other:
   //
@@ -1588,6 +2300,12 @@ void pollSonos() {
     // Older firmware uses TrackMetaData instead.
     metaData = xmlUnescape(extractByLocalName(positionBody, "TrackMetaData"));
   }
+
+  // Report the blob and the three elements taken from it. A zero-length blob
+  // means the metadata never arrived and no amount of parser work will help; a
+  // populated blob with a missing dc:title points at extraction instead. See
+  // logDidlState() for how to read this line.
+  if (capturing) logDidlState(metaData);
 
   // Title and artist are resolved by this one function, so neither field can
   // be handled differently from the other. The DIDL element is preferred and
@@ -1654,10 +2372,20 @@ void pollSonos() {
   }
 
   // Only re-render when the track or the artwork actually changed.
+  //
+  // artNeedsRender must NOT be set here. A progressive JPEG is only ever decoded as a
+  // DC-scan thumbnail (JPEGDEC decodes the first scan and forces 1/8 scale), which is
+  // slow enough to stall the main loop. Re-arming it on every title/artist change made
+  // renderArtwork() run again on each 1 s poll, starving the poll, the buttons and the
+  // idle timer — the screen froze on a stale snapshot.
+  //
+  // The artwork re-render is triggered only by downloadArtwork(), when the cached file
+  // actually changes (new URI, or a re-fetch after a speaker switch). drawScreen()
+  // clears and redraws the artwork region whenever it needs to, via renderArtwork()'s
+  // own screen-clearing, so a plain track change does not need a re-decode.
   if (title != currentTitle || artist != currentArtist) {
     currentTitle   = title;
     currentArtist  = artist;
-    artNeedsRender = true;
 
     // Report the title with its length and first bytes, so a title that
     // parses but renders as nothing can be identified from the log.
@@ -1670,7 +2398,13 @@ void pollSonos() {
   }
 
   if (artUri != currentArtUri) {
-    currentArtUri = artUri;
+    // A new track (or a newly available artwork URI). Arm a delayed fetch rather than
+    // downloading inline: immediately after a track change the speaker is often still
+    // settling, and an early request frequently times out. The artwork retry below then
+    // keeps trying until it succeeds.
+    currentArtUri    = artUri;
+    artworkPending   = artUri.length() > 0;
+    artworkFirstTry  = millis() + ARTWORK_INITIAL_DELAY_MS;
 
     if (artUri.length() == 0) {
       Serial.println("[Sonos] No artwork URI in response for this track.");
@@ -1681,10 +2415,18 @@ void pollSonos() {
       Serial.printf("[Sonos] Artwork as sent: %s\n", artUri.c_str());
       Serial.printf("[Sonos] Artwork resolved: %s\n",
                     resolveArtworkUrl(artUri).c_str());
+    }
+  }
 
-      // downloadArtwork() re-checks against cachedArtUrl using the RESOLVED
-      // url, so no comparison is made here.
-      downloadArtwork();
+  // Keep retrying until the artwork for this track is on disk. Without this, a single
+  // failed attempt was permanent: the only other trigger was the URI changing, so a
+  // transient timeout left the PREVIOUS track's cover on screen indefinitely.
+  if (artworkPending && (long)(artworkFirstTry - millis()) <= 0) {
+    if (downloadArtwork()) {
+      artworkPending = false;
+    } else {
+      artworkFirstTry = millis() + ARTWORK_RETRY_INTERVAL_MS;
+      Serial.printf("[Art] Retrying in %d ms.\n", ARTWORK_RETRY_INTERVAL_MS);
     }
   }
 
@@ -1853,10 +2595,25 @@ void drawArtworkPlaceholder() {
                  ART_AREA_Y + 14);
 
   // Status line: HTTP code, or the reason there is no code.
-  String statusText = (artLastStatus > 0) ? String(artLastStatus) : artLastNote;
+  //
+  // A failure reason takes priority over the code. HTTP 200 only means the
+  // speaker answered - it is returned for a body with no EOI marker and for a
+  // file that then fails to decode, so showing "200" for those made the panel
+  // useless for diagnosis: three different faults rendered identically.
+  String statusText;
+  if (artRenderError.length() > 0)        statusText = artRenderError;
+  else if (artDownloadError.length() > 0) statusText = artDownloadError;
+  else if (artLastStatus > 0)             statusText = String(artLastStatus);
+  else                                    statusText = artLastNote;
+
   if (statusText.length() == 0) statusText = "...";
-  tft.setTextColor(artLastStatus == 200 ? 0x9CFF9C : 0xFF8080);
-  tft.drawString(statusText, 120, ART_AREA_Y + 36);
+
+  bool healthy = (artRenderError.length() == 0 && artDownloadError.length() == 0 &&
+                  artLastStatus == 200);
+
+  tft.setTextColor(healthy ? 0x9CFF9C : 0xFF8080);
+  tft.drawString(ellipsize(statusText, ART_AREA_W - 8, 2), 120,
+                 ART_AREA_Y + 36);
 
   // ---- Small-font detail --------------------------------------------
   tft.setTextDatum(TL_DATUM);
@@ -1888,6 +2645,9 @@ void drawArtworkPlaceholder() {
 // handles the full-screen clear and the artwork area.
 void drawNothingPlayingScreen() {
   tft.fillScreen(TFT_BLACK);
+  // The clear above wiped the artwork, so invalidate the revision guard so it will be
+  // decoded again when playback resumes.
+  artDrawnRevision = 0xFFFFFFFF;
   drawArtworkPlaceholder();
   invalidateMetadata();
 }
@@ -1940,7 +2700,10 @@ void setScreenPower(bool on) {
     Serial.println("[Screen] Backlight on.");
     tft.fillScreen(TFT_BLACK);
     lastIdleSecondsRemaining = -1;
-    artNeedsRender          = true;
+    // The fillScreen above wiped the artwork, so it genuinely must be decoded again
+    // even though the cached file has not changed.
+    artDrawnRevision = 0xFFFFFFFF;
+    artNeedsRender   = true;
   } else {
     Serial.println("[Screen] Backlight off.");
     tft.fillScreen(TFT_BLACK);
@@ -2149,6 +2912,101 @@ void drawScreen() {
 }
 
 // ---------------------------------------------------------------------------
+// Serial console
+// ---------------------------------------------------------------------------
+//
+// Single-key commands on the monitor UART.
+//
+// Every question raised during hardware bring-up used to cost a rebuild and a
+// reflash, which is what turned debugging into a loop: the only way to test an
+// idea was to commit it to the firmware first, so each hypothesis produced a
+// build rather than an observation. These commands let the running device
+// answer questions on demand, so an experiment no longer requires a change.
+//
+//   d  dump GetPositionInfo now (element map, head, tail, DIDL state)
+//   x  delete the cached /art.jpg (it survives a reflash)
+//   f  re-arm the artwork fetch for the current track
+//   m  heap, WiFi RSSI and cached artwork size
+//   h  this list
+//
+// Non-blocking by construction: it only drains bytes that have already arrived
+// and never waits for more, so it cannot stall the poll, the buttons or the
+// idle timer.
+void handleSerialCommands() {
+  while (Serial.available() > 0) {
+    int c = Serial.read();
+    if (c < 0) break;
+
+    switch (c) {
+      case 'd': case 'D': {
+        Serial.println("[Cmd] Requesting GetPositionInfo...");
+        String body = sonosSoap("GetPositionInfo", "<InstanceID>0</InstanceID>");
+
+        if (body.length() == 0) {
+          Serial.println("[Cmd] No response from the speaker.");
+          break;
+        }
+
+        logPositionInfoBody(body);
+
+        String meta =
+            xmlUnescape(extractByLocalName(body, "CurrentTrackMetaData"));
+        if (meta.length() == 0) {
+          meta = xmlUnescape(extractByLocalName(body, "TrackMetaData"));
+        }
+        logDidlState(meta);
+        break;
+      }
+
+      case 'x': case 'X':
+        // /art.jpg outlives a reflash, so clearing it is the only way to test
+        // the download path with a cold cache.
+        if (LittleFS.remove(ART_FILE_PATH)) {
+          Serial.println("[Cmd] Removed /art.jpg.");
+        } else {
+          Serial.println("[Cmd] No /art.jpg to remove.");
+        }
+        cachedArtUrl = String();
+        artRevision++;
+        break;
+
+      case 'f': case 'F':
+        // Re-arm the fetch even though the URI is unchanged, which
+        // downloadArtwork() would otherwise short-circuit on.
+        cachedArtUrl   = String();
+        artworkPending = (currentArtUri.length() > 0);
+        artworkFirstTry = millis();
+        Serial.println("[Cmd] Artwork fetch re-armed.");
+        break;
+
+      case 'm': case 'M': {
+        size_t cached = 0;
+        if (LittleFS.exists(ART_FILE_PATH)) {
+          File art = LittleFS.open(ART_FILE_PATH, "r");
+          if (art) {
+            cached = art.size();
+            art.close();
+          }
+        }
+        Serial.printf("[Cmd] heap=%u min=%u largest=%u rssi=%d cached=%u\n",
+                      (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(),
+                      (unsigned)ESP.getMaxAllocHeap(), (int)WiFi.RSSI(),
+                      (unsigned)cached);
+        break;
+      }
+
+      case 'h': case 'H':
+        Serial.println(F("[Cmd] d=dump position info, x=erase /art.jpg, "
+                         "f=re-fetch artwork, m=memory/rssi"));
+        break;
+
+      default:
+        break;  // line endings and stray bytes are ignored
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Arduino entry points
 // ---------------------------------------------------------------------------
 
@@ -2185,9 +3043,6 @@ void setup() {
   digitalWrite(TFT_BL, TFT_BACKLIGHT_ON);
   screenPowered = true;
 
-  // Artwork decoder callback.
-  TJpgDec.setCallback(tft_output);
-
   // LittleFS, formatting if the mount fails.
   if (!LittleFS.begin(LITTLEFS_LABEL)) {
     Serial.println("[LittleFS] Mount failed, formatting LittleFS...");
@@ -2209,6 +3064,13 @@ void setup() {
 }
 
 void loop() {
+  // ---- Serial console ---------------------------------------------------
+#if SERIAL_CONSOLE
+  // First, so a command is acted on even if the rest of this pass returns
+  // early (no WiFi, or still searching for a speaker).
+  handleSerialCommands();
+#endif
+
   // ---- Buttons ---------------------------------------------------------
   bool wakeRequested = false;
 

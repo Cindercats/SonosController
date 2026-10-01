@@ -1,8 +1,8 @@
 # Project Configuration Settings
 
 ## Application Settings
-- **Application Version**: `0.02` (defined as `APP_VERSION` in main.cpp)
-- **Version Increment**: Increased by 0.01 on each rebuild (per README.md)
+- **Application Version**: see `APP_VERSION` in `src/main.cpp` (auto-incremented by 0.01 on each build; currently `0.70`)
+- **Version Increment**: increased by 0.01 on each rebuild, via `version_bump.py` (opt out with `PLATFORMIO_SKIP_VERSION_BUMP=1`)
 
 ## WiFi Configuration
 - **Primary SSID**: set in `src/secrets.h` (`WIFI_SSID_PRIMARY`)
@@ -54,28 +54,34 @@
 - **HTTP Redirect Limit**: 3 redirects (max 4 attempts total)
 
 ## Feature Status (per README.md Checklist)
-- [ ] Application Version Display
-- [ ] WiFi Connectivity (with fallback SSID)
-- [ ] Sonos Speaker Auto-discovery + Fallback
-- [ ] Track & Artist Display (with '/getaa' exclusion)
-- [ ] Track Position & Duration + Progress Bar
-- [ ] Artwork Display (/getaa) - **NEEDS DEBUGGING** (requires terminal debug output)
-- [ ] Idle State & Auto Screen Shutdown (10s timeout)
-- [ ] Hardware Controls (debounced buttons, backlight control)
+- [x] Application Version Display
+- [x] WiFi Connectivity (with fallback SSID)
+- [x] Sonos Speaker Auto-discovery + Fallback
+- [x] Track & Artist Display (with '/getaa' exclusion)
+- [x] Track Position & Duration + Progress Bar
+- [~] Artwork Display (/getaa) - **PARTIAL**: URI extraction, download, redirects,
+      chunked-transfer handling and LittleFS caching are all verified working on hardware
+      (138,711 bytes). Colour order is fixed. However JPEGDEC decodes progressive JPEGs
+      **DC-scan only**, so progressive artwork renders as a low-detail thumbnail, and the
+      forced 1/8 scale stalled the main loop (fixed by not re-arming renders on metadata
+      changes). The proper fix is to request a baseline rendition from `/getaa`.
+      See README.md section 6.5 and ARTWORK-ATTEMPTS.md.
+- [x] Idle State & Auto Screen Shutdown (10s timeout)
+- [x] Hardware Controls (debounced buttons, backlight control)
 
 ## Future Settings Needed (from README.md & Code Analysis)
-1. **Artwork Debugging**: Add Serial.print statements for:
-   - Artwork URL resolution
-   - Download progress and errors
-   - HTTP redirect handling
-   - LittleFS write/read status
-   - JPEG decoding results
+1. **Artwork Decode** (outstanding): `esp_jpg_decode()` cannot decode the progressive
+   JPEGs Sonos serves, and JPEGDEC only decodes the DC scan (a low-detail thumbnail).
+   The preferred option is to request a baseline rendition from `/getaa`; the fallback
+   is a progressive-capable decoder. See README.md section 6.10.
 
 2. **Secondary WiFi SSID**: DONE - `WIFI_SSID_SECONDARY` is defined in `src/secrets.h`.
 
-3. **Version Automation**: Implement build script to auto-increment APP_VERSION by 0.01 on each compile.
+3. **Version Automation**: DONE - `version_bump.py` auto-increments `APP_VERSION` by
+   0.01 on each compile.
 
-4. **Artwork Fallback Enhancement**: Improve vinyl placeholder or add alternative fallback artwork.
+4. **Artwork Fallback Enhancement**: Improve the vinyl placeholder or add alternative
+   fallback artwork.
 
 5. **Network Resilience**: Add retry mechanisms for failed Sonos queries and artwork downloads.
 
