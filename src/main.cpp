@@ -63,7 +63,7 @@
 // ---------------------------------------------------------------------------
 
 // Application version. Incremented by 0.01 on each build.
-#define APP_VERSION "0.81"
+#define APP_VERSION "0.82"
 
 // ---------------------------------------------------------------------------
 // WiFi Configuration
